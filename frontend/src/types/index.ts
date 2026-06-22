@@ -892,6 +892,12 @@ export interface Account {
   cache_ttl_override_enabled?: boolean | null
   cache_ttl_override_target?: string | null
 
+  // 模拟缓存（对所有账号类型有效）
+  // 启用后按随机百分比将 input_tokens 拆分为 cache_read_input_tokens，覆盖上游缓存命中
+  simulate_cache_enabled?: boolean | null
+  simulate_cache_min_percent?: number | null
+  simulate_cache_max_percent?: number | null
+
   // 自定义 Base URL 中继转发（仅 Anthropic OAuth/SetupToken 账号有效）
   custom_base_url_enabled?: boolean | null
   custom_base_url?: string | null

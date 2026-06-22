@@ -1759,6 +1759,62 @@
         </div>
       </div>
 
+      <!-- Simulate Cache (对所有账号类型有效) -->
+      <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
+        <div class="flex items-center justify-between">
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.simulateCache.label') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.simulateCache.hint') }}
+            </p>
+          </div>
+          <button
+            type="button"
+            @click="simulateCacheEnabled = !simulateCacheEnabled"
+            :class="[
+              'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+              simulateCacheEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+            ]"
+          >
+            <span
+              :class="[
+                'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                simulateCacheEnabled ? 'translate-x-5' : 'translate-x-0'
+              ]"
+            />
+          </button>
+        </div>
+        <div v-if="simulateCacheEnabled" class="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <label class="input-label text-xs">{{ t('admin.accounts.simulateCache.minPercent') }}</label>
+            <input
+              v-model.number="simulateCacheMinPercent"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              class="input mt-1"
+              :placeholder="t('admin.accounts.simulateCache.minPercentPlaceholder')"
+            />
+          </div>
+          <div>
+            <label class="input-label text-xs">{{ t('admin.accounts.simulateCache.maxPercent') }}</label>
+            <input
+              v-model.number="simulateCacheMaxPercent"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              class="input mt-1"
+              :placeholder="t('admin.accounts.simulateCache.maxPercentPlaceholder')"
+            />
+          </div>
+          <p class="col-span-2 text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.simulateCache.rangeHint') }}
+          </p>
+        </div>
+      </div>
+
       <div>
         <div class="flex items-center justify-between">
           <div>
@@ -2575,6 +2631,11 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+
+// 模拟缓存（对所有账号类型有效）
+const simulateCacheEnabled = ref(false)
+const simulateCacheMinPercent = ref<number>(0)
+const simulateCacheMaxPercent = ref<number>(0)
 
 // OpenAI 自动透传开关（OAuth/API Key）
 const openaiPassthroughEnabled = ref(false)
@@ -3455,6 +3516,16 @@ function loadQuotaControlSettings(account: Account) {
   cacheTTLOverrideTarget.value = '5m'
   customBaseUrlEnabled.value = false
   customBaseUrl.value = ''
+  simulateCacheEnabled.value = false
+  simulateCacheMinPercent.value = 0
+  simulateCacheMaxPercent.value = 0
+
+  // 模拟缓存对所有账号类型有效，从后端 DTO 字段加载
+  if (account.simulate_cache_enabled === true) {
+    simulateCacheEnabled.value = true
+    simulateCacheMinPercent.value = account.simulate_cache_min_percent ?? 0
+    simulateCacheMaxPercent.value = account.simulate_cache_max_percent ?? 0
+  }
 
   // Remaining quota control settings only apply to Anthropic accounts
   if (account.platform !== 'anthropic') {
@@ -4203,6 +4274,25 @@ const handleSubmit = async () => {
       }
       // Quota notify config
       writeQuotaNotifyToExtra(newExtra, 'update')
+      updatePayload.extra = newExtra
+    }
+
+    // 模拟缓存（对所有账号类型有效）：合并到最终 extra
+    {
+      const currentExtra = (updatePayload.extra as Record<string, unknown>) ||
+        (props.account.extra as Record<string, unknown>) || {}
+      const newExtra: Record<string, unknown> = { ...currentExtra }
+      if (simulateCacheEnabled.value) {
+        newExtra.simulate_cache_enabled = true
+        const minPct = typeof simulateCacheMinPercent.value === 'number' ? simulateCacheMinPercent.value : 0
+        const maxPct = typeof simulateCacheMaxPercent.value === 'number' ? simulateCacheMaxPercent.value : 0
+        newExtra.simulate_cache_min_percent = Math.max(0, Math.min(100, minPct))
+        newExtra.simulate_cache_max_percent = Math.max(0, Math.min(100, maxPct))
+      } else {
+        delete newExtra.simulate_cache_enabled
+        delete newExtra.simulate_cache_min_percent
+        delete newExtra.simulate_cache_max_percent
+      }
       updatePayload.extra = newExtra
     }
 

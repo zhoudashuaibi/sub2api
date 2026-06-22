@@ -6,10 +6,12 @@ import (
 	"errors"
 	"hash/fnv"
 	"log/slog"
+	"math/rand"
 	"reflect"
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/Wei-Shaw/sub2api/internal/config"
@@ -1712,6 +1714,108 @@ func (a *Account) GetCacheTTLOverrideTarget() string {
 		}
 	}
 	return "5m"
+}
+
+// IsSimulateCacheEnabled 检查账号是否启用模拟缓存。
+// 启用后，对该账号的每次请求，按 min~max 百分比随机将 input_tokens 拆分为
+// cache_read_input_tokens，覆盖上游真实缓存命中数据（用于统一下游定价）。
+func (a *Account) IsSimulateCacheEnabled() bool {
+	if a == nil || a.Extra == nil {
+		return false
+	}
+	enabled, ok := a.Extra["simulate_cache_enabled"].(bool)
+	return ok && enabled
+}
+
+// GetSimulateCacheMinPercent 返回模拟缓存最小命中百分比（0-100）。
+// 未配置或非法时回退为 0。
+func (a *Account) GetSimulateCacheMinPercent() float64 {
+	if a == nil || a.Extra == nil {
+		return 0
+	}
+	return clampSimulateCachePercent(parseExtraFloat64(a.Extra["simulate_cache_min_percent"]))
+}
+
+// GetSimulateCacheMaxPercent 返回模拟缓存最大命中百分比（0-100）。
+// 未配置或非法时回退为 0。
+func (a *Account) GetSimulateCacheMaxPercent() float64 {
+	if a == nil || a.Extra == nil {
+		return 0
+	}
+	return clampSimulateCachePercent(parseExtraFloat64(a.Extra["simulate_cache_max_percent"]))
+}
+
+// clampSimulateCachePercent 将百分比约束在 [0, 100] 区间。
+func clampSimulateCachePercent(v float64) float64 {
+	if v < 0 {
+		return 0
+	}
+	if v > 100 {
+		return 100
+	}
+	return v
+}
+
+// simulateCacheRand 用于模拟缓存比例随机数生成。
+// 使用独立实例避免干扰其它 math/rand 使用方；并发安全。
+var simulateCacheRand = struct {
+	mu   sync.Mutex
+	rand *rand.Rand
+}{
+	rand: rand.New(rand.NewSource(time.Now().UnixNano())),
+}
+
+// randFloat64 返回 [0.0, 1.0) 区间的随机浮点数，并发安全。
+func randFloat64() float64 {
+	simulateCacheRand.mu.Lock()
+	defer simulateCacheRand.mu.Unlock()
+	return simulateCacheRand.rand.Float64()
+}
+
+// ResolveSimulateCacheRate 返回本次请求的模拟缓存命中比例（0-1）。
+// 若未启用或区间非法（min > max、max == 0），返回 0 表示不模拟。
+func (a *Account) ResolveSimulateCacheRate() float64 {
+	if a == nil || !a.IsSimulateCacheEnabled() {
+		return 0
+	}
+	minPct := a.GetSimulateCacheMinPercent()
+	maxPct := a.GetSimulateCacheMaxPercent()
+	if maxPct <= 0 {
+		return 0
+	}
+	if minPct > maxPct {
+		minPct = maxPct
+	}
+	// [minPct, maxPct] 区间内随机取值
+	span := maxPct - minPct
+	var pct float64
+	if span <= 1e-9 {
+		pct = minPct
+	} else {
+		pct = minPct + randFloat64()*span
+	}
+	return pct / 100.0
+}
+
+func applySimulateCacheToClaudeUsage(usage *ClaudeUsage, account *Account) bool {
+	if usage == nil {
+		return false
+	}
+	rate := account.ResolveSimulateCacheRate()
+	if rate <= 0 {
+		return false
+	}
+	total := usage.InputTokens + usage.CacheReadInputTokens
+	if total <= 0 {
+		return false
+	}
+	cached := int(float64(total) * rate)
+	if cached > total {
+		cached = total
+	}
+	usage.CacheReadInputTokens = cached
+	usage.InputTokens = total - cached
+	return true
 }
 
 // GetQuotaLimit 获取 API Key 账号的配额限制（美元）

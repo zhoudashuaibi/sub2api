@@ -445,6 +445,11 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 	// When the terminal event has an empty output array, reconstruct from
 	// accumulated delta events so the client receives the full content.
 	acc.SupplementResponseOutput(finalResponse)
+	usageSimulatedCache := false
+	if finalResponse.Usage != nil && applySimulateCacheToResponsesUsage(finalResponse.Usage, account) {
+		usageSimulatedCache = true
+		usage = copyOpenAIUsageFromResponsesUsage(finalResponse.Usage)
+	}
 
 	chatResp := apicompat.ResponsesToChatCompletions(finalResponse, originalModel)
 
@@ -459,13 +464,14 @@ func (s *OpenAIGatewayService) handleChatBufferedStreamingResponse(
 	c.JSON(http.StatusOK, chatResp)
 
 	return &OpenAIForwardResult{
-		RequestID:     requestID,
-		Usage:         usage,
-		Model:         originalModel,
-		BillingModel:  billingModel,
-		UpstreamModel: upstreamModel,
-		Stream:        false,
-		Duration:      time.Since(startTime),
+		RequestID:            requestID,
+		Usage:                usage,
+		UsageSimulatedCache:  usageSimulatedCache,
+		Model:                originalModel,
+		BillingModel:         billingModel,
+		UpstreamModel:        upstreamModel,
+		Stream:               false,
+		Duration:             time.Since(startTime),
 	}, nil
 }
 
@@ -510,6 +516,7 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 	firstChunk := true
 	clientDisconnected := false
 	clientOutputStarted := false
+	usageSimulatedCache := false
 	pendingSSE := make([]string, 0, 4)
 	refusalDetector := newOpenAIChatSilentRefusalDetector(requestBodyLen)
 	var streamFailoverErr *UpstreamFailoverError
@@ -537,14 +544,15 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 	resultWithUsage := func() *OpenAIForwardResult {
 		return &OpenAIForwardResult{
-			RequestID:     requestID,
-			Usage:         usage,
-			Model:         originalModel,
-			BillingModel:  billingModel,
-			UpstreamModel: upstreamModel,
-			Stream:        true,
-			Duration:      time.Since(startTime),
-			FirstTokenMs:  firstTokenMs,
+			RequestID:            requestID,
+			Usage:                usage,
+			UsageSimulatedCache:  usageSimulatedCache,
+			Model:                originalModel,
+			BillingModel:         billingModel,
+			UpstreamModel:        upstreamModel,
+			Stream:               true,
+			Duration:             time.Since(startTime),
+			FirstTokenMs:         firstTokenMs,
 		}
 	}
 
@@ -567,6 +575,13 @@ func (s *OpenAIGatewayService) handleChatStreamingResponse(
 
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(event.Type)
 		if isTerminalEvent {
+			simulateCacheRate := account.ResolveSimulateCacheRate()
+			if event.Usage != nil && applySimulateCacheRateToResponsesUsage(event.Usage, simulateCacheRate) {
+				usageSimulatedCache = true
+			}
+			if event.Response != nil && event.Response.Usage != nil && applySimulateCacheRateToResponsesUsage(event.Response.Usage, simulateCacheRate) {
+				usageSimulatedCache = true
+			}
 			if event.Usage != nil {
 				usage = copyOpenAIUsageFromResponsesUsage(event.Usage)
 			}

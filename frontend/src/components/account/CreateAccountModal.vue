@@ -2752,6 +2752,62 @@
         </div>
       </div>
 
+      <!-- Simulate Cache (对所有账号类型有效) -->
+      <div class="rounded-lg border border-gray-200 p-4 dark:border-dark-600">
+        <div class="flex items-center justify-between">
+          <div>
+            <label class="input-label mb-0">{{ t('admin.accounts.simulateCache.label') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.simulateCache.hint') }}
+            </p>
+          </div>
+          <button
+            type="button"
+            @click="simulateCacheEnabled = !simulateCacheEnabled"
+            :class="[
+              'relative inline-flex h-6 w-11 flex-shrink-0 cursor-pointer rounded-full border-2 border-transparent transition-colors duration-200 ease-in-out focus:outline-none focus:ring-2 focus:ring-primary-500 focus:ring-offset-2',
+              simulateCacheEnabled ? 'bg-primary-600' : 'bg-gray-200 dark:bg-dark-600'
+            ]"
+          >
+            <span
+              :class="[
+                'pointer-events-none inline-block h-5 w-5 transform rounded-full bg-white shadow ring-0 transition duration-200 ease-in-out',
+                simulateCacheEnabled ? 'translate-x-5' : 'translate-x-0'
+              ]"
+            />
+          </button>
+        </div>
+        <div v-if="simulateCacheEnabled" class="mt-3 grid grid-cols-2 gap-3">
+          <div>
+            <label class="input-label text-xs">{{ t('admin.accounts.simulateCache.minPercent') }}</label>
+            <input
+              v-model.number="simulateCacheMinPercent"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              class="input mt-1"
+              :placeholder="t('admin.accounts.simulateCache.minPercentPlaceholder')"
+            />
+          </div>
+          <div>
+            <label class="input-label text-xs">{{ t('admin.accounts.simulateCache.maxPercent') }}</label>
+            <input
+              v-model.number="simulateCacheMaxPercent"
+              type="number"
+              min="0"
+              max="100"
+              step="1"
+              class="input mt-1"
+              :placeholder="t('admin.accounts.simulateCache.maxPercentPlaceholder')"
+            />
+          </div>
+          <p class="col-span-2 text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.simulateCache.rangeHint') }}
+          </p>
+        </div>
+      </div>
+
       <div>
         <div class="flex items-center justify-between">
           <div>
@@ -3543,6 +3599,18 @@ function buildAntigravityExtra(): Record<string, unknown> | undefined {
 const buildOpenAICompactModelMapping = () =>
   buildModelMappingObject('mapping', [], openAICompactModelMappings.value)
 
+const withSimulateCacheExtra = (base?: Record<string, unknown>): Record<string, unknown> | undefined => {
+  const extra: Record<string, unknown> = { ...(base || {}) }
+  if (simulateCacheEnabled.value) {
+    const minPct = typeof simulateCacheMinPercent.value === 'number' ? simulateCacheMinPercent.value : 0
+    const maxPct = typeof simulateCacheMaxPercent.value === 'number' ? simulateCacheMaxPercent.value : 0
+    extra.simulate_cache_enabled = true
+    extra.simulate_cache_min_percent = Math.max(0, Math.min(100, minPct))
+    extra.simulate_cache_max_percent = Math.max(0, Math.min(100, maxPct))
+  }
+  return Object.keys(extra).length > 0 ? extra : undefined
+}
+
 const showMixedChannelWarning = ref(false)
 const mixedChannelWarningDetails = ref<{ groupName: string; currentPlatform: string; otherPlatform: string } | null>(
   null
@@ -3578,6 +3646,11 @@ const cacheTTLOverrideEnabled = ref(false)
 const cacheTTLOverrideTarget = ref<string>('5m')
 const customBaseUrlEnabled = ref(false)
 const customBaseUrl = ref('')
+
+// 模拟缓存（对所有账号类型有效）
+const simulateCacheEnabled = ref(false)
+const simulateCacheMinPercent = ref<number>(0)
+const simulateCacheMaxPercent = ref<number>(0)
 
 // Gemini tier selection (used as fallback when auto-detection is unavailable/fails)
 const geminiTierGoogleOne = ref<'google_one_free' | 'google_ai_pro' | 'google_ai_ultra'>('google_one_free')
@@ -4269,6 +4342,9 @@ const resetForm = () => {
   cacheTTLOverrideTarget.value = '5m'
   customBaseUrlEnabled.value = false
   customBaseUrl.value = ''
+  simulateCacheEnabled.value = false
+  simulateCacheMinPercent.value = 0
+  simulateCacheMaxPercent.value = 0
   allowOverages.value = false
   antigravityAccountType.value = 'oauth'
   upstreamBaseUrl.value = ''
@@ -4665,7 +4741,7 @@ const handleSubmit = async () => {
   }
 
   form.credentials = credentials
-  const extra = buildAnthropicExtra(buildOpenAIExtra())
+  const extra = withSimulateCacheExtra(buildAnthropicExtra(buildOpenAIExtra()))
 
   await doCreateAccount({
     ...form,
@@ -4727,9 +4803,9 @@ const createAccountAndFinish = async (
     return
   }
   // Inject quota limits for apikey/bedrock accounts
-  let finalExtra = extra
+  let finalExtra = withSimulateCacheExtra(extra)
   if (type === 'apikey' || type === 'bedrock') {
-    const quotaExtra: Record<string, unknown> = { ...(extra || {}) }
+    const quotaExtra: Record<string, unknown> = { ...(finalExtra || {}) }
     if (editQuotaLimit.value != null && editQuotaLimit.value > 0) {
       quotaExtra.quota_limit = editQuotaLimit.value
     }
@@ -4813,7 +4889,7 @@ const handleOpenAIExchange = async (authCode: string) => {
 
     const credentials = oauthClient.buildCredentials(tokenInfo)
     const oauthExtra = oauthClient.buildExtraInfo(tokenInfo) as Record<string, unknown> | undefined
-    const extra = buildOpenAIExtra(oauthExtra)
+    const extra = withSimulateCacheExtra(buildOpenAIExtra(oauthExtra))
     const shouldCreateOpenAI = form.platform === 'openai'
 
     // Add model mapping for OpenAI OAuth accounts（透传模式下不应用）
@@ -4915,7 +4991,7 @@ const handleOpenAIImportCodexSession = async (content: string) => {
   oauthClient.error.value = ''
 
   try {
-    const extra = buildOpenAIExtra()
+    const extra = withSimulateCacheExtra(buildOpenAIExtra())
     const result = await adminAPI.accounts.importCodexSession({
       content: trimmed,
       name: form.name,
@@ -5019,7 +5095,7 @@ const handleOpenAIBatchRT = async (refreshTokenInput: string, clientId?: string)
           credentials.client_id = clientId
         }
         const oauthExtra = oauthClient.buildExtraInfo(tokenInfo) as Record<string, unknown> | undefined
-        const extra = buildOpenAIExtra(oauthExtra)
+        const extra = withSimulateCacheExtra(buildOpenAIExtra(oauthExtra))
 
         // Add model mapping for OpenAI OAuth accounts（透传模式下不应用）
         if (shouldCreateOpenAI && !isOpenAIModelRestrictionDisabled.value) {
@@ -5144,7 +5220,7 @@ const handleAntigravityValidateRT = async (refreshTokenInput: string) => {
           platform: 'antigravity',
           type: 'oauth',
           credentials,
-          extra: {},
+          extra: withSimulateCacheExtra(),
           proxy_id: form.proxy_id,
           concurrency: form.concurrency,
           load_factor: form.load_factor ?? undefined,
@@ -5485,7 +5561,7 @@ const handleCookieAuth = async (sessionKey: string) => {
           platform: form.platform,
           type: addMethod.value, // Use addMethod as type: 'oauth' or 'setup-token'
           credentials,
-          extra,
+          extra: withSimulateCacheExtra(extra),
           proxy_id: form.proxy_id,
           concurrency: form.concurrency,
           load_factor: form.load_factor ?? undefined,

@@ -224,6 +224,7 @@ type OpenAIForwardResult struct {
 	RequestID  string
 	ResponseID string
 	Usage      OpenAIUsage
+	UsageSimulatedCache bool
 	Model      string // 原始模型（用于响应和日志显示）
 	// BillingModel is the model used for cost calculation.
 	// When non-empty, CalculateCost uses this instead of Model.
@@ -3062,12 +3063,14 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		responseID := ""
 		imageCount := 0
 		var imageOutputSizes []string
+		usageSimulatedCache := false
 		if reqStream {
 			streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, upstreamModel)
 			if err != nil {
 				return nil, err
 			}
 			usage = streamResult.usage
+			usageSimulatedCache = streamResult.usageSimulatedCache
 			firstTokenMs = streamResult.firstTokenMs
 			responseID = strings.TrimSpace(streamResult.responseID)
 			imageCount = streamResult.imageCount
@@ -3078,6 +3081,7 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 				return nil, err
 			}
 			usage = nonStreamResult.usage
+			usageSimulatedCache = nonStreamResult.usageSimulatedCache
 			responseID = strings.TrimSpace(nonStreamResult.responseID)
 			imageCount = nonStreamResult.imageCount
 			imageOutputSizes = nonStreamResult.imageOutputSizes
@@ -3096,17 +3100,18 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 		}
 
 		forwardResult := &OpenAIForwardResult{
-			RequestID:       resp.Header.Get("x-request-id"),
-			ResponseID:      responseID,
-			Usage:           *usage,
-			Model:           originalModel,
-			UpstreamModel:   upstreamModel,
-			ServiceTier:     serviceTier,
-			ReasoningEffort: reasoningEffort,
-			Stream:          reqStream,
-			OpenAIWSMode:    false,
-			Duration:        time.Since(startTime),
-			FirstTokenMs:    firstTokenMs,
+			RequestID:            resp.Header.Get("x-request-id"),
+			ResponseID:           responseID,
+			Usage:                *usage,
+			UsageSimulatedCache:  usageSimulatedCache,
+			Model:                originalModel,
+			UpstreamModel:        upstreamModel,
+			ServiceTier:          serviceTier,
+			ReasoningEffort:      reasoningEffort,
+			Stream:               reqStream,
+			OpenAIWSMode:         false,
+			Duration:             time.Since(startTime),
+			FirstTokenMs:         firstTokenMs,
 		}
 		if imageCount > 0 {
 			forwardResult.ImageCount = imageCount
@@ -3299,22 +3304,25 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 	responseID := ""
 	imageCount := 0
 	var imageOutputSizes []string
+	usageSimulatedCache := false
 	if reqStream {
 		result, err := s.handleStreamingResponsePassthrough(ctx, resp, c, account, startTime, reqModel, upstreamPassthroughModel)
 		if err != nil {
 			return nil, err
 		}
 		usage = result.usage
+		usageSimulatedCache = result.usageSimulatedCache
 		firstTokenMs = result.firstTokenMs
 		responseID = strings.TrimSpace(result.responseID)
 		imageCount = result.imageCount
 		imageOutputSizes = result.imageOutputSizes
 	} else {
-		result, err := s.handleNonStreamingResponsePassthrough(ctx, resp, c, reqModel, upstreamPassthroughModel)
+		result, err := s.handleNonStreamingResponsePassthrough(ctx, resp, c, account, reqModel, upstreamPassthroughModel)
 		if err != nil {
 			return nil, err
 		}
 		usage = result.usage
+		usageSimulatedCache = result.usageSimulatedCache
 		responseID = strings.TrimSpace(result.responseID)
 		imageCount = result.imageCount
 		imageOutputSizes = result.imageOutputSizes
@@ -3333,6 +3341,7 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		RequestID:       resp.Header.Get("x-request-id"),
 		ResponseID:      responseID,
 		Usage:           *usage,
+		UsageSimulatedCache: usageSimulatedCache,
 		Model:           reqModel,
 		UpstreamModel:   upstreamPassthroughModel,
 		ServiceTier:     serviceTier,
@@ -3660,19 +3669,21 @@ func collectOpenAIPassthroughTimeoutHeaders(h http.Header) []string {
 }
 
 type openaiStreamingResultPassthrough struct {
-	usage            *OpenAIUsage
-	firstTokenMs     *int
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
+	usage               *OpenAIUsage
+	usageSimulatedCache bool
+	firstTokenMs        *int
+	responseID          string
+	imageCount          int
+	imageOutputSizes    []string
 }
 
 type openaiNonStreamingResultPassthrough struct {
 	*OpenAIUsage
-	usage            *OpenAIUsage
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
+	usage               *OpenAIUsage
+	usageSimulatedCache bool
+	responseID          string
+	imageCount          int
+	imageOutputSizes    []string
 }
 
 func openAIStreamClientOutputStarted(c *gin.Context, localStarted bool) bool {
@@ -3820,6 +3831,8 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	sawTerminalEvent := false
 	sawFailedEvent := false
 	failedMessage := ""
+	simulateCacheRate := account.ResolveSimulateCacheRate()
+	usageSimulatedCache := false
 	clientOutputStarted := false
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
 	pendingLines := make([]string, 0, 8)
@@ -3847,11 +3860,12 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 	needModelReplace := strings.TrimSpace(originalModel) != "" && strings.TrimSpace(mappedModel) != "" && strings.TrimSpace(originalModel) != strings.TrimSpace(mappedModel)
 	resultWithUsage := func() *openaiStreamingResultPassthrough {
 		return &openaiStreamingResultPassthrough{
-			usage:            usage,
-			firstTokenMs:     firstTokenMs,
-			responseID:       responseID,
-			imageCount:       imageCounter.Count(),
-			imageOutputSizes: imageCounter.Sizes(),
+			usage:               usage,
+			usageSimulatedCache: usageSimulatedCache,
+			firstTokenMs:        firstTokenMs,
+			responseID:          responseID,
+			imageCount:          imageCounter.Count(),
+			imageOutputSizes:    imageCounter.Sizes(),
 		}
 	}
 
@@ -3902,6 +3916,16 @@ func (s *OpenAIGatewayService) handleStreamingResponsePassthrough(
 				responseID = extractOpenAIResponseIDFromJSONBytes(dataBytes)
 			}
 			imageCounter.AddSSEData(dataBytes)
+			if simulateCacheRate > 0 && openAIStreamEventIsTerminal(trimmedData) {
+				if newBytes, changed := applySimulateCacheToOpenAISSE(dataBytes, simulateCacheRate); changed {
+					usageSimulatedCache = true
+					dataBytes = newBytes
+					line = "data: " + string(newBytes)
+					if replacedData, replaced := extractOpenAISSEDataLine(line); replaced {
+						trimmedData = strings.TrimSpace(replacedData)
+					}
+				}
+			}
 			lineStartsClientOutput = forceFlushFailedEvent || openAIStreamDataStartsClientOutput(trimmedData, eventType)
 			if firstTokenMs == nil && lineStartsClientOutput && trimmedData != "[DONE]" {
 				ms := int(time.Since(startTime).Milliseconds())
@@ -3985,6 +4009,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	ctx context.Context,
 	resp *http.Response,
 	c *gin.Context,
+	account *Account,
 	originalModel string,
 	mappedModel string,
 ) (*openaiNonStreamingResultPassthrough, error) {
@@ -3998,7 +4023,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	// stream=false was requested. Without this conversion the client would
 	// receive raw SSE text or a terminal event with empty output.
 	if isEventStreamResponse(resp.Header) {
-		return s.handlePassthroughSSEToJSON(resp, c, body, originalModel, mappedModel)
+		return s.handlePassthroughSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
 
 	usage := &OpenAIUsage{}
@@ -4020,16 +4045,22 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 	if contentType == "" {
 		contentType = "application/json"
 	}
+	usageSimulatedCache := applySimulateCacheToOpenAIUsage(usage, account)
+	if usageSimulatedCache {
+		body = setOpenAIUsageCacheFields(body, usage)
+	}
+
 	if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 		body = s.replaceModelInResponseBody(body, mappedModel, originalModel)
 	}
 	c.Data(resp.StatusCode, contentType, body)
 	return &openaiNonStreamingResultPassthrough{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
-		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
+		OpenAIUsage:         usage,
+		usage:               usage,
+		usageSimulatedCache: usageSimulatedCache,
+		responseID:          extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:          countOpenAIResponseImageOutputsFromJSONBytes(body),
+		imageOutputSizes:    collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
 }
 
@@ -4037,14 +4068,19 @@ func (s *OpenAIGatewayService) handleNonStreamingResponsePassthrough(
 // response for the passthrough path. It mirrors handleSSEToJSON while
 // preserving passthrough payloads, except compact-only model remapping may
 // rewrite model fields back to the original requested model.
-func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
+func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel string, mappedModel string) (*openaiNonStreamingResultPassthrough, error) {
 	bodyText := string(body)
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
 
 	usage := &OpenAIUsage{}
+	usageSimulatedCache := false
 	if ok {
 		if parsedUsage, parsed := extractOpenAIUsageFromJSONBytes(finalResponse); parsed {
 			*usage = parsedUsage
+		}
+		if applySimulateCacheToOpenAIUsage(usage, account) {
+			usageSimulatedCache = true
+			finalResponse = setOpenAIUsageCacheFields(finalResponse, usage)
 		}
 		// When the terminal event has an empty output array, reconstruct
 		// output from accumulated delta events so the client gets full content.
@@ -4071,6 +4107,14 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
 		usage = s.parseSSEUsageFromBody(bodyText)
+		simulateCacheRate := account.ResolveSimulateCacheRate()
+		if simulateCacheRate > 0 {
+			if updatedBodyText, changed := applySimulateCacheToOpenAISSEBody(bodyText, simulateCacheRate); changed {
+				bodyText = updatedBodyText
+				usage = s.parseSSEUsageFromBody(bodyText)
+				usageSimulatedCache = true
+			}
+		}
 		if originalModel != "" && mappedModel != "" && originalModel != mappedModel {
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
@@ -4089,11 +4133,12 @@ func (s *OpenAIGatewayService) handlePassthroughSSEToJSON(resp *http.Response, c
 	c.Data(resp.StatusCode, contentType, body)
 
 	return &openaiNonStreamingResultPassthrough{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
-		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
+		OpenAIUsage:         usage,
+		usage:               usage,
+		usageSimulatedCache: usageSimulatedCache,
+		responseID:          extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:          countOpenAIImageOutputsFromSSEBody(bodyText),
+		imageOutputSizes:    collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 	}, nil
 }
 
@@ -4605,19 +4650,21 @@ func (s *OpenAIGatewayService) handleCompatErrorResponse(
 
 // openaiStreamingResult streaming response result
 type openaiStreamingResult struct {
-	usage            *OpenAIUsage
-	firstTokenMs     *int
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
+	usage               *OpenAIUsage
+	usageSimulatedCache bool
+	firstTokenMs        *int
+	responseID          string
+	imageCount          int
+	imageOutputSizes    []string
 }
 
 type openaiNonStreamingResult struct {
 	*OpenAIUsage
-	usage            *OpenAIUsage
-	responseID       string
-	imageCount       int
-	imageOutputSizes []string
+	usage               *OpenAIUsage
+	usageSimulatedCache bool
+	responseID          string
+	imageCount          int
+	imageOutputSizes    []string
 }
 
 func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel string) (*openaiStreamingResult, error) {
@@ -4651,6 +4698,8 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	}
 
 	usage := &OpenAIUsage{}
+	// 模拟缓存：预先算好本次请求的命中比例，供终止事件改写 usage 使用。
+	simulateCacheRate := account.ResolveSimulateCacheRate()
 	imageCounter := newOpenAIImageOutputCounter()
 	var firstTokenMs *int
 	responseID := ""
@@ -4733,13 +4782,15 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 	streamOutputAccumulator := apicompat.NewBufferedResponseAccumulator()
 	streamImageOutputs := make([]json.RawMessage, 0, 1)
 	streamSeenImages := make(map[string]struct{})
+	usageSimulatedCache := false
 	resultWithUsage := func() *openaiStreamingResult {
 		return &openaiStreamingResult{
-			usage:            usage,
-			firstTokenMs:     firstTokenMs,
-			responseID:       responseID,
-			imageCount:       imageCounter.Count(),
-			imageOutputSizes: imageCounter.Sizes(),
+			usage:               usage,
+			usageSimulatedCache: usageSimulatedCache,
+			firstTokenMs:        firstTokenMs,
+			responseID:          responseID,
+			imageCount:          imageCounter.Count(),
+			imageOutputSizes:    imageCounter.Sizes(),
 		}
 	}
 	finalizeStream := func() (*openaiStreamingResult, error) {
@@ -4872,6 +4923,15 @@ func (s *OpenAIGatewayService) handleStreamingResponse(ctx context.Context, resp
 			// Fast path: most events do not contain model field values.
 			if needModelReplace && mappedModel != "" && strings.Contains(line, mappedModel) {
 				line = s.replaceModelInSSELine(line, mappedModel, originalModel)
+			}
+			// 模拟缓存：在终止事件中改写 usage，让下游客户端看到缓存命中。
+			if simulateCacheRate > 0 && openAIStreamEventIsTerminal(data) {
+				if newBytes, changed := applySimulateCacheToOpenAISSE(dataBytes, simulateCacheRate); changed {
+					usageSimulatedCache = true
+					dataBytes = newBytes
+					data = string(newBytes)
+					line = "data: " + data
+				}
 			}
 			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
 
@@ -5190,6 +5250,137 @@ func extractOpenAIUsageFromJSONBytes(body []byte) (OpenAIUsage, bool) {
 	return openAIUsageFromGJSON(gjson.GetBytes(body, "response.usage"))
 }
 
+func applySimulateCacheToOpenAIUsage(usage *OpenAIUsage, account *Account) bool {
+	if usage == nil {
+		return false
+	}
+	rate := account.ResolveSimulateCacheRate()
+	if rate <= 0 {
+		return false
+	}
+	total := usage.InputTokens
+	if total <= 0 {
+		return false
+	}
+	cached := int(float64(total) * rate)
+	if cached > total {
+		cached = total
+	}
+	usage.CacheReadInputTokens = cached
+	return true
+}
+
+func setOpenAIUsageCacheFields(body []byte, usage *OpenAIUsage) []byte {
+	if len(body) == 0 || usage == nil {
+		return body
+	}
+	usagePath := "usage"
+	if !gjson.GetBytes(body, usagePath).Exists() && gjson.GetBytes(body, "response.usage").Exists() {
+		usagePath = "response.usage"
+	}
+	out := body
+	if newBody, err := sjson.SetBytes(out, usagePath+".cache_read_input_tokens", usage.CacheReadInputTokens); err == nil {
+		out = newBody
+	}
+	if newBody, err := sjson.SetBytes(out, usagePath+".input_tokens_details.cached_tokens", usage.CacheReadInputTokens); err == nil {
+		out = newBody
+	}
+	return out
+}
+
+func applySimulateCacheToResponsesUsage(usage *apicompat.ResponsesUsage, account *Account) bool {
+	if usage == nil {
+		return false
+	}
+	rate := account.ResolveSimulateCacheRate()
+	return applySimulateCacheRateToResponsesUsage(usage, rate)
+}
+
+func applySimulateCacheRateToResponsesUsage(usage *apicompat.ResponsesUsage, rate float64) bool {
+	if usage == nil {
+		return false
+	}
+	if rate <= 0 {
+		return false
+	}
+	total := usage.InputTokens
+	if total <= 0 {
+		return false
+	}
+	cached := int(float64(total) * rate)
+	if cached > total {
+		cached = total
+	}
+	if usage.InputTokensDetails == nil {
+		usage.InputTokensDetails = &apicompat.ResponsesInputTokensDetails{}
+	}
+	usage.InputTokensDetails.CachedTokens = cached
+	return true
+}
+
+// applySimulateCacheToOpenAISSE 在 OpenAI Responses SSE 终止事件中按 rate 拆分
+// input_tokens 到 cache_read_input_tokens，回写 data 的 usage 字段。
+// 返回新的 data 字节及是否发生变更。OpenAI 语义 input_tokens 含 cache_read，
+// 故仅设置 cache_read_input_tokens / input_tokens_details.cached_tokens。
+func applySimulateCacheToOpenAISSE(data []byte, rate float64) ([]byte, bool) {
+	if len(data) == 0 || rate <= 0 {
+		return data, false
+	}
+	// usage 可能在顶层 usage 或 response.usage
+	usagePath := "usage"
+	usageNode := gjson.GetBytes(data, "usage")
+	if !usageNode.Exists() {
+		usagePath = "response.usage"
+		usageNode = gjson.GetBytes(data, "response.usage")
+		if !usageNode.Exists() {
+			return data, false
+		}
+	}
+	total := usageNode.Get("input_tokens").Int()
+	if total <= 0 {
+		return data, false
+	}
+	cached := int64(float64(total) * rate)
+	if cached > total {
+		cached = total
+	}
+	out := data
+	if newPath, err := sjson.SetBytes(out, usagePath+".cache_read_input_tokens", cached); err == nil {
+		out = newPath
+	}
+	if newPath, err := sjson.SetBytes(out, usagePath+".input_tokens_details.cached_tokens", cached); err == nil {
+		out = newPath
+	}
+	return out, true
+}
+
+func applySimulateCacheToOpenAISSEBody(bodyText string, rate float64) (string, bool) {
+	if bodyText == "" || rate <= 0 {
+		return bodyText, false
+	}
+	lines := strings.SplitAfter(bodyText, "\n")
+	changed := false
+	for i, line := range lines {
+		lineBody := strings.TrimRight(line, "\r\n")
+		data, ok := extractOpenAISSEDataLine(lineBody)
+		if !ok || !openAIStreamEventIsTerminal(strings.TrimSpace(data)) {
+			continue
+		}
+		newData, lineChanged := applySimulateCacheToOpenAISSE([]byte(data), rate)
+		if !lineChanged {
+			continue
+		}
+		newLine := "data: " + string(newData)
+		suffix := line[len(lineBody):]
+		lines[i] = newLine + suffix
+		changed = true
+	}
+	if !changed {
+		return bodyText, false
+	}
+	return strings.Join(lines, ""), true
+}
+
 func extractOpenAIResponseIDFromJSONBytes(body []byte) string {
 	if len(body) == 0 || !gjson.ValidBytes(body) {
 		return ""
@@ -5256,7 +5447,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// Some OpenAI-compatible upstreams (including other sub2api instances)
 	// may return SSE even when stream=false was requested.
 	if isEventStreamResponse(resp.Header) {
-		return s.handleSSEToJSON(resp, c, body, originalModel, mappedModel)
+		return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
 	bodyLooksLikeSSE := bytes.Contains(body, []byte("data:")) || bytes.Contains(body, []byte("event:"))
 
@@ -5266,17 +5457,22 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// positives on JSON responses that coincidentally contain "data:" or
 	// "event:" in their text content.
 	if account.Type == AccountTypeOAuth && bodyLooksLikeSSE {
-		return s.handleSSEToJSON(resp, c, body, originalModel, mappedModel)
+		return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
 
 	usageValue, usageOK := extractOpenAIUsageFromJSONBytes(body)
 	if !usageOK {
 		if bodyLooksLikeSSE {
-			return s.handleSSEToJSON(resp, c, body, originalModel, mappedModel)
+			return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 		}
 		return nil, fmt.Errorf("parse response: invalid json response")
 	}
 	usage := &usageValue
+
+	usageSimulatedCache := applySimulateCacheToOpenAIUsage(usage, account)
+	if usageSimulatedCache {
+		body = setOpenAIUsageCacheFields(body, usage)
+	}
 
 	// Replace model in response if needed
 	if originalModel != mappedModel {
@@ -5295,11 +5491,12 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	c.Data(resp.StatusCode, contentType, body)
 
 	return &openaiNonStreamingResult{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIResponseImageOutputsFromJSONBytes(body),
-		imageOutputSizes: collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
+		OpenAIUsage:         usage,
+		usage:               usage,
+		usageSimulatedCache: usageSimulatedCache,
+		responseID:          extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:          countOpenAIResponseImageOutputsFromJSONBytes(body),
+		imageOutputSizes:    collectOpenAIResponseImageOutputSizesFromJSONBytes(body),
 	}, nil
 }
 
@@ -5308,14 +5505,19 @@ func isEventStreamResponse(header http.Header) bool {
 	return strings.Contains(contentType, "text/event-stream")
 }
 
-func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
+func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Context, account *Account, body []byte, originalModel, mappedModel string) (*openaiNonStreamingResult, error) {
 	bodyText := string(body)
 	finalResponse, ok := extractCodexFinalResponse(bodyText)
 
 	usage := &OpenAIUsage{}
+	usageSimulatedCache := false
 	if ok {
 		if parsedUsage, parsed := extractOpenAIUsageFromJSONBytes(finalResponse); parsed {
 			*usage = parsedUsage
+		}
+		if applySimulateCacheToOpenAIUsage(usage, account) {
+			usageSimulatedCache = true
+			finalResponse = setOpenAIUsageCacheFields(finalResponse, usage)
 		}
 		// When the terminal event has an empty output array, reconstruct
 		// output from accumulated delta events so the client gets full content.
@@ -5343,6 +5545,14 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
 		usage = s.parseSSEUsageFromBody(bodyText)
+		simulateCacheRate := account.ResolveSimulateCacheRate()
+		if simulateCacheRate > 0 {
+			if updatedBodyText, changed := applySimulateCacheToOpenAISSEBody(bodyText, simulateCacheRate); changed {
+				bodyText = updatedBodyText
+				usage = s.parseSSEUsageFromBody(bodyText)
+				usageSimulatedCache = true
+			}
+		}
 		if originalModel != mappedModel {
 			bodyText = s.replaceModelInSSEBody(bodyText, mappedModel, originalModel)
 		}
@@ -5361,11 +5571,12 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 	c.Data(resp.StatusCode, contentType, body)
 
 	return &openaiNonStreamingResult{
-		OpenAIUsage:      usage,
-		usage:            usage,
-		responseID:       extractOpenAIResponseIDFromJSONBytes(body),
-		imageCount:       countOpenAIImageOutputsFromSSEBody(bodyText),
-		imageOutputSizes: collectOpenAIImageOutputSizesFromSSEBody(bodyText),
+		OpenAIUsage:         usage,
+		usage:               usage,
+		usageSimulatedCache: usageSimulatedCache,
+		responseID:          extractOpenAIResponseIDFromJSONBytes(body),
+		imageCount:          countOpenAIImageOutputsFromSSEBody(bodyText),
+		imageOutputSizes:    collectOpenAIImageOutputSizesFromSSEBody(bodyText),
 	}, nil
 }
 
@@ -5907,6 +6118,12 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	account := input.Account
 	subscription := input.Subscription
 	ApplyOpenAIImageBillingResolution(result)
+
+	if !result.UsageSimulatedCache && applySimulateCacheToOpenAIUsage(&result.Usage, account) {
+		result.UsageSimulatedCache = true
+		logger.LegacyPrintf("service.openai_gateway", "simulate_cache: account=%d total=%d cached=%d",
+			account.ID, result.Usage.InputTokens, result.Usage.CacheReadInputTokens)
+	}
 
 	// 计算实际的新输入token（减去缓存读取的token）
 	// 因为 input_tokens 包含了 cache_read_tokens，而缓存读取的token不应按输入价格计费

@@ -553,6 +553,7 @@ type ClaudeUsage struct {
 type ForwardResult struct {
 	RequestID string
 	Usage     ClaudeUsage
+	UsageSimulatedCache bool
 	Model     string
 	// UpstreamModel is the actual upstream model after mapping.
 	// Prefer empty when it is identical to Model; persistence normalizes equal values away as no-op mappings.
@@ -5464,6 +5465,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 	var usage *ClaudeUsage
 	var firstTokenMs *int
 	var clientDisconnect bool
+	usageSimulatedCache := false
 	if reqStream {
 		streamResult, err := s.handleStreamingResponse(ctx, resp, c, account, startTime, originalModel, reqModel, shouldMimicClaudeCode)
 		if err != nil {
@@ -5512,6 +5514,7 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 			return nil, err
 		}
 		usage = streamResult.usage
+		usageSimulatedCache = streamResult.usageSimulatedCache
 		firstTokenMs = streamResult.firstTokenMs
 		clientDisconnect = streamResult.clientDisconnect
 	} else {
@@ -5519,17 +5522,19 @@ func (s *GatewayService) Forward(ctx context.Context, c *gin.Context, account *A
 		if err != nil {
 			return nil, err
 		}
+		usageSimulatedCache = account != nil && account.IsSimulateCacheEnabled() && usage != nil && usage.InputTokens+usage.CacheReadInputTokens > 0
 	}
 
 	return &ForwardResult{
-		RequestID:        resp.Header.Get("x-request-id"),
-		Usage:            *usage,
-		Model:            originalModel, // 使用原始模型用于计费和日志
-		UpstreamModel:    mappedModel,
-		Stream:           reqStream,
-		Duration:         time.Since(startTime),
-		FirstTokenMs:     firstTokenMs,
-		ClientDisconnect: clientDisconnect,
+		RequestID:           resp.Header.Get("x-request-id"),
+		Usage:               *usage,
+		UsageSimulatedCache: usageSimulatedCache,
+		Model:               originalModel, // 使用原始模型用于计费和日志
+		UpstreamModel:       mappedModel,
+		Stream:              reqStream,
+		Duration:            time.Since(startTime),
+		FirstTokenMs:        firstTokenMs,
+		ClientDisconnect:    clientDisconnect,
 	}, nil
 }
 
@@ -5766,12 +5771,14 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 	var usage *ClaudeUsage
 	var firstTokenMs *int
 	var clientDisconnect bool
+	usageSimulatedCache := false
 	if input.RequestStream {
 		streamResult, err := s.handleStreamingResponseAnthropicAPIKeyPassthrough(ctx, resp, c, account, input.StartTime, input.RequestModel)
 		if err != nil {
 			return nil, err
 		}
 		usage = streamResult.usage
+		usageSimulatedCache = streamResult.usageSimulatedCache
 		firstTokenMs = streamResult.firstTokenMs
 		clientDisconnect = streamResult.clientDisconnect
 	} else {
@@ -5779,20 +5786,22 @@ func (s *GatewayService) forwardAnthropicAPIKeyPassthroughWithInput(
 		if err != nil {
 			return nil, err
 		}
+		usageSimulatedCache = account != nil && account.IsSimulateCacheEnabled() && usage != nil && usage.CacheReadInputTokens > 0
 	}
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
 
 	return &ForwardResult{
-		RequestID:        resp.Header.Get("x-request-id"),
-		Usage:            *usage,
-		Model:            input.OriginalModel,
-		UpstreamModel:    input.RequestModel,
-		Stream:           input.RequestStream,
-		Duration:         time.Since(input.StartTime),
-		FirstTokenMs:     firstTokenMs,
-		ClientDisconnect: clientDisconnect,
+		RequestID:            resp.Header.Get("x-request-id"),
+		Usage:                *usage,
+		UsageSimulatedCache:  usageSimulatedCache,
+		Model:                input.OriginalModel,
+		UpstreamModel:        input.RequestModel,
+		Stream:               input.RequestStream,
+		Duration:             time.Since(input.StartTime),
+		FirstTokenMs:         firstTokenMs,
+		ClientDisconnect:     clientDisconnect,
 	}, nil
 }
 
@@ -5899,6 +5908,8 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 	var firstTokenMs *int
 	clientDisconnected := false
 	sawTerminalEvent := false
+	simulateCacheRate := account.ResolveSimulateCacheRate()
+	usageSimulatedCache := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -5981,28 +5992,28 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 					if clientDisconnected && streamInterval > 0 {
 						lastRead := time.Unix(0, atomic.LoadInt64(&lastReadAt))
 						if time.Since(lastRead) >= streamInterval {
-							return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
+							return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
 						}
 					}
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
 				if sawTerminalEvent {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 				}
 				if clientDisconnected {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after disconnect: %w", ev.err)
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after disconnect: %w", ev.err)
 				}
 				if errors.Is(ev.err, context.Canceled) || errors.Is(ev.err, context.DeadlineExceeded) {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete: %w", ev.err)
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete: %w", ev.err)
 				}
 				if errors.Is(ev.err, bufio.ErrTooLong) {
 					logger.LegacyPrintf("service.gateway", "[Anthropic passthrough] SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, ev.err)
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, ev.err
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, ev.err
 				}
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
 			}
 
 			line := ev.line
@@ -6010,6 +6021,19 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				trimmed := strings.TrimSpace(data)
 				if anthropicStreamEventIsTerminal("", trimmed) {
 					sawTerminalEvent = true
+				}
+				if simulateCacheRate > 0 && strings.HasPrefix(trimmed, "{") {
+					var event map[string]any
+					if err := json.Unmarshal([]byte(data), &event); err == nil && strings.TrimSpace(fmt.Sprint(event["type"])) == "message_start" {
+						if msg, ok := event["message"].(map[string]any); ok {
+							if u, ok := msg["usage"].(map[string]any); ok && applySimulateCacheToUsageObj(u, simulateCacheRate) {
+								if b, err := json.Marshal(event); err == nil {
+									data = string(b)
+									line = "data: " + data
+								}
+							}
+						}
+					}
 				}
 				if firstTokenMs == nil && trimmed != "" && trimmed != "[DONE]" {
 					ms := int(time.Since(startTime).Milliseconds())
@@ -6047,13 +6071,13 @@ func (s *GatewayService) handleStreamingResponseAnthropicAPIKeyPassthrough(
 				continue
 			}
 			if clientDisconnected {
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
 			}
 			logger.LegacyPrintf("service.gateway", "[Anthropic passthrough] Stream data interval timeout: account=%d model=%s interval=%s", account.ID, model, streamInterval)
 			if s.rateLimitService != nil {
 				s.rateLimitService.HandleStreamTimeout(ctx, account, model)
 			}
-			return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream data interval timeout")
+			return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, fmt.Errorf("stream data interval timeout")
 
 		case <-keepaliveCh:
 			if clientDisconnected || inPartialEvent {
@@ -6260,6 +6284,14 @@ func (s *GatewayService) handleNonStreamingResponseAnthropicAPIKeyPassthrough(
 	}
 
 	usage := parseClaudeUsageFromResponseBody(body)
+	if applySimulateCacheToClaudeUsage(usage, account) {
+		if newBody, err := sjson.SetBytes(body, "usage.input_tokens", usage.InputTokens); err == nil {
+			body = newBody
+		}
+		if newBody, err := sjson.SetBytes(body, "usage.cache_read_input_tokens", usage.CacheReadInputTokens); err == nil {
+			body = newBody
+		}
+	}
 
 	writeAnthropicPassthroughResponseHeaders(c.Writer.Header(), resp.Header, s.responseHeaderFilter)
 	contentType := strings.TrimSpace(resp.Header.Get("Content-Type"))
@@ -6408,12 +6440,14 @@ func (s *GatewayService) forwardBedrock(
 	var usage *ClaudeUsage
 	var firstTokenMs *int
 	var clientDisconnect bool
+	usageSimulatedCache := false
 	if reqStream {
 		streamResult, err := s.handleBedrockStreamingResponse(ctx, resp, c, account, startTime, reqModel)
 		if err != nil {
 			return nil, err
 		}
 		usage = streamResult.usage
+		usageSimulatedCache = streamResult.usageSimulatedCache
 		firstTokenMs = streamResult.firstTokenMs
 		clientDisconnect = streamResult.clientDisconnect
 	} else {
@@ -6421,20 +6455,22 @@ func (s *GatewayService) forwardBedrock(
 		if err != nil {
 			return nil, err
 		}
+		usageSimulatedCache = account != nil && account.IsSimulateCacheEnabled() && usage != nil && usage.InputTokens+usage.CacheReadInputTokens > 0
 	}
 	if usage == nil {
 		usage = &ClaudeUsage{}
 	}
 
 	return &ForwardResult{
-		RequestID:        resp.Header.Get("x-amzn-requestid"),
-		Usage:            *usage,
-		Model:            reqModel,
-		UpstreamModel:    mappedModel,
-		Stream:           reqStream,
-		Duration:         time.Since(startTime),
-		FirstTokenMs:     firstTokenMs,
-		ClientDisconnect: clientDisconnect,
+		RequestID:           resp.Header.Get("x-amzn-requestid"),
+		Usage:               *usage,
+		UsageSimulatedCache: usageSimulatedCache,
+		Model:               reqModel,
+		UpstreamModel:       mappedModel,
+		Stream:              reqStream,
+		Duration:            time.Since(startTime),
+		FirstTokenMs:        firstTokenMs,
+		ClientDisconnect:    clientDisconnect,
 	}, nil
 }
 
@@ -6671,6 +6707,14 @@ func (s *GatewayService) handleBedrockNonStreamingResponse(
 	body = transformBedrockInvocationMetrics(body)
 
 	usage := parseClaudeUsageFromResponseBody(body)
+	if applySimulateCacheToClaudeUsage(usage, account) {
+		if newBody, err := sjson.SetBytes(body, "usage.input_tokens", usage.InputTokens); err == nil {
+			body = newBody
+		}
+		if newBody, err := sjson.SetBytes(body, "usage.cache_read_input_tokens", usage.CacheReadInputTokens); err == nil {
+			body = newBody
+		}
+	}
 
 	c.Header("Content-Type", "application/json")
 	if v := resp.Header.Get("x-amzn-requestid"); v != "" {
@@ -8076,9 +8120,10 @@ func (s *GatewayService) handleRetryExhaustedError(ctx context.Context, resp *ht
 
 // streamingResult 流式响应结果
 type streamingResult struct {
-	usage            *ClaudeUsage
-	firstTokenMs     *int
-	clientDisconnect bool // 客户端是否在流式传输过程中断开
+	usage               *ClaudeUsage
+	usageSimulatedCache bool
+	firstTokenMs        *int
+	clientDisconnect    bool // 客户端是否在流式传输过程中断开
 }
 
 func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http.Response, c *gin.Context, account *Account, startTime time.Time, originalModel, mappedModel string, mimicClaudeCode bool) (*streamingResult, error) {
@@ -8211,6 +8256,8 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 	needModelReplace := originalModel != mappedModel
 	clientDisconnected := false // 客户端断开标志，断开后继续读取上游以获取完整usage
 	sawTerminalEvent := false
+	simulateCacheRate := account.ResolveSimulateCacheRate()
+	usageSimulatedCache := false
 
 	pendingEventLines := make([]string, 0, 4)
 
@@ -8298,6 +8345,19 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			}
 		}
 
+		// 模拟缓存：在 message_start 事件中按账号配置随机拆分 input/cache_read，
+		// 覆盖上游 usage 并回写 SSE 事件。用于上游无缓存命中但下游统一定价的场景。
+		if eventType == "message_start" && simulateCacheRate > 0 {
+			if msg, ok := event["message"].(map[string]any); ok {
+				if u, ok := msg["usage"].(map[string]any); ok {
+					if applySimulateCacheToUsageObj(u, simulateCacheRate) {
+						usageSimulatedCache = true
+						eventChanged = true
+					}
+				}
+			}
+		}
+
 		if needModelReplace {
 			if msg, ok := event["message"].(map[string]any); ok {
 				if model, ok := msg["model"].(string); ok && model == mappedModel {
@@ -8345,27 +8405,27 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 			if !ok {
 				// 上游完成，返回结果
 				if !sawTerminalEvent {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, fmt.Errorf("stream usage incomplete: missing terminal event")
 				}
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 			}
 			if ev.err != nil {
 				if sawTerminalEvent {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: clientDisconnected}, nil
 				}
 				// 检测 context 取消（客户端断开会导致 context 取消，进而影响上游读取）
 				if errors.Is(ev.err, context.Canceled) || errors.Is(ev.err, context.DeadlineExceeded) {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete: %w", ev.err)
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete: %w", ev.err)
 				}
 				// 客户端已通过写入失败检测到断开，上游也出错了，返回已收集的 usage
 				if clientDisconnected {
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after disconnect: %w", ev.err)
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after disconnect: %w", ev.err)
 				}
 				// 客户端未断开，正常的错误处理
 				if errors.Is(ev.err, bufio.ErrTooLong) {
 					logger.LegacyPrintf("service.gateway", "SSE line too long: account=%d max_size=%d error=%v", account.ID, maxLineSize, ev.err)
 					sendErrorEvent("response_too_large", fmt.Sprintf("upstream SSE line exceeded %d bytes", maxLineSize))
-					return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, ev.err
+					return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, ev.err
 				}
 				// 上游中途读错误（unexpected EOF / connection reset 等，常见于 HTTP/2 GOAWAY）：
 				// 若尚未向客户端写过任何字节，包成 UpstreamFailoverError 让 handler 层走 failover/重试。
@@ -8390,7 +8450,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 					}
 				}
 				sendErrorEvent("stream_read_error", disconnectMsg)
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, fmt.Errorf("stream read error: %w", ev.err)
 			}
 			line := ev.line
 			trimmed := strings.TrimSpace(line)
@@ -8404,7 +8464,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				pendingEventLines = pendingEventLines[:0]
 				if err != nil {
 					if clientDisconnected {
-						return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, nil
+						return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, nil
 					}
 					return nil, err
 				}
@@ -8441,7 +8501,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				continue
 			}
 			if clientDisconnected {
-				return &streamingResult{usage: usage, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
+				return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs, clientDisconnect: true}, fmt.Errorf("stream usage incomplete after timeout")
 			}
 			logger.LegacyPrintf("service.gateway", "Stream data interval timeout: account=%d model=%s interval=%s", account.ID, originalModel, streamInterval)
 			// 处理流超时，可能标记账户为临时不可调度或错误状态
@@ -8449,7 +8509,7 @@ func (s *GatewayService) handleStreamingResponse(ctx context.Context, resp *http
 				s.rateLimitService.HandleStreamTimeout(ctx, account, originalModel)
 			}
 			sendErrorEvent("stream_timeout", fmt.Sprintf("upstream stream idle for %s", streamInterval))
-			return &streamingResult{usage: usage, firstTokenMs: firstTokenMs}, fmt.Errorf("stream data interval timeout")
+			return &streamingResult{usage: usage, usageSimulatedCache: usageSimulatedCache, firstTokenMs: firstTokenMs}, fmt.Errorf("stream data interval timeout")
 
 		case <-keepaliveCh:
 			if clientDisconnected {
@@ -8753,6 +8813,15 @@ func (s *GatewayService) handleNonStreamingResponse(ctx context.Context, resp *h
 			if newBody, err := sjson.SetBytes(body, "usage.cache_creation.ephemeral_1h_input_tokens", response.Usage.CacheCreation1hTokens); err == nil {
 				body = newBody
 			}
+		}
+	}
+
+	if applySimulateCacheToClaudeUsage(&response.Usage, account) {
+		if newBody, err := sjson.SetBytes(body, "usage.input_tokens", response.Usage.InputTokens); err == nil {
+			body = newBody
+		}
+		if newBody, err := sjson.SetBytes(body, "usage.cache_read_input_tokens", response.Usage.CacheReadInputTokens); err == nil {
+			body = newBody
 		}
 	}
 
@@ -9395,6 +9464,15 @@ func (s *GatewayService) recordUsageCore(ctx context.Context, input *recordUsage
 			result.Usage.InputTokens, account.ID)
 		result.Usage.CacheReadInputTokens += result.Usage.InputTokens
 		result.Usage.InputTokens = 0
+	}
+
+	if !result.UsageSimulatedCache && applySimulateCacheToClaudeUsage(&result.Usage, account) {
+		result.UsageSimulatedCache = true
+		logger.LegacyPrintf("service.gateway", "simulate_cache: account=%d total=%d cached=%d input=%d",
+			account.ID,
+			result.Usage.InputTokens+result.Usage.CacheReadInputTokens,
+			result.Usage.CacheReadInputTokens,
+			result.Usage.InputTokens)
 	}
 
 	// Cache TTL Override: 确保计费时 token 分类与账号设置一致。
@@ -10567,6 +10645,29 @@ func reconcileCachedTokens(usage map[string]any) bool {
 		return false
 	}
 	usage["cache_read_input_tokens"] = cached
+	return true
+}
+
+// applySimulateCacheToUsageObj 按 rate 将 usage 中的 input_tokens + cache_read_input_tokens
+// 总量随机拆分为 cache_read / input，覆盖上游缓存命中数据。返回是否发生变更。
+// usage 是 SSE 事件中的 usage JSON 对象（map[string]any）。
+func applySimulateCacheToUsageObj(usage map[string]any, rate float64) bool {
+	if usage == nil || rate <= 0 {
+		return false
+	}
+	inputTokens, _ := parseSSEUsageInt(usage["input_tokens"])
+	cacheRead, _ := parseSSEUsageInt(usage["cache_read_input_tokens"])
+	total := inputTokens + cacheRead
+	if total <= 0 {
+		return false
+	}
+	cached := int(float64(total) * rate)
+	if cached > total {
+		cached = total
+	}
+	input := total - cached
+	usage["input_tokens"] = float64(input)
+	usage["cache_read_input_tokens"] = float64(cached)
 	return true
 }
 

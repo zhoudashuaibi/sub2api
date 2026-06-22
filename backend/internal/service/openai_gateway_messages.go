@@ -363,7 +363,7 @@ func (s *OpenAIGatewayService) ForwardAsAnthropic(
 		result, handleErr = s.handleAnthropicStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
 	} else {
 		// Client wants JSON: buffer the streaming response and assemble a JSON reply.
-		result, handleErr = s.handleAnthropicBufferedStreamingResponse(resp, c, originalModel, billingModel, upstreamModel, startTime)
+		result, handleErr = s.handleAnthropicBufferedStreamingResponse(resp, c, account, originalModel, billingModel, upstreamModel, startTime)
 	}
 
 	// cyber_policy：标记已设、error 已按 Anthropic 格式发给客户端。丢弃 result、返回哨兵，
@@ -436,6 +436,7 @@ func (s *OpenAIGatewayService) handleAnthropicErrorResponse(
 func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	resp *http.Response,
 	c *gin.Context,
+	account *Account,
 	originalModel string,
 	billingModel string,
 	upstreamModel string,
@@ -478,6 +479,11 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	// When the terminal event has an empty output array, reconstruct from
 	// accumulated delta events so the client receives the full content.
 	acc.SupplementResponseOutput(finalResponse)
+	usageSimulatedCache := false
+	if finalResponse.Usage != nil && applySimulateCacheToResponsesUsage(finalResponse.Usage, account) {
+		usageSimulatedCache = true
+		usage = copyOpenAIUsageFromResponsesUsage(finalResponse.Usage)
+	}
 
 	anthropicResp := apicompat.ResponsesToAnthropic(finalResponse, originalModel)
 
@@ -487,14 +493,15 @@ func (s *OpenAIGatewayService) handleAnthropicBufferedStreamingResponse(
 	c.JSON(http.StatusOK, anthropicResp)
 
 	return &OpenAIForwardResult{
-		RequestID:     requestID,
-		ResponseID:    finalResponse.ID,
-		Usage:         usage,
-		Model:         originalModel,
-		BillingModel:  billingModel,
-		UpstreamModel: upstreamModel,
-		Stream:        false,
-		Duration:      time.Since(startTime),
+		RequestID:            requestID,
+		ResponseID:           finalResponse.ID,
+		Usage:                usage,
+		UsageSimulatedCache:  usageSimulatedCache,
+		Model:                originalModel,
+		BillingModel:         billingModel,
+		UpstreamModel:        upstreamModel,
+		Stream:               false,
+		Duration:             time.Since(startTime),
 	}, nil
 }
 
@@ -733,6 +740,7 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	firstChunk := true
 	clientDisconnected := false
 	clientOutputStarted := false
+	usageSimulatedCache := false
 
 	scanner := bufio.NewScanner(resp.Body)
 	maxLineSize := defaultMaxLineSize
@@ -758,16 +766,17 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 	// resultWithUsage builds the final result snapshot.
 	resultWithUsage := func() *OpenAIForwardResult {
 		return &OpenAIForwardResult{
-			RequestID:        requestID,
-			ResponseID:       responseID,
-			Usage:            usage,
-			Model:            originalModel,
-			BillingModel:     billingModel,
-			UpstreamModel:    upstreamModel,
-			Stream:           true,
-			Duration:         time.Since(startTime),
-			FirstTokenMs:     firstTokenMs,
-			ClientDisconnect: clientDisconnected,
+			RequestID:            requestID,
+			ResponseID:           responseID,
+			Usage:                usage,
+			UsageSimulatedCache:  usageSimulatedCache,
+			Model:                originalModel,
+			BillingModel:         billingModel,
+			UpstreamModel:        upstreamModel,
+			Stream:               true,
+			Duration:             time.Since(startTime),
+			FirstTokenMs:         firstTokenMs,
+			ClientDisconnect:     clientDisconnected,
 		}
 	}
 
@@ -790,13 +799,20 @@ func (s *OpenAIGatewayService) handleAnthropicStreamingResponse(
 
 		isTerminalEvent := isOpenAICompatResponsesTerminalEvent(event.Type)
 		if isTerminalEvent {
+			simulateCacheRate := account.ResolveSimulateCacheRate()
 			if event.Response != nil {
 				if id := strings.TrimSpace(event.Response.ID); id != "" {
 					responseID = id
 				}
+				if event.Response.Usage != nil && applySimulateCacheRateToResponsesUsage(event.Response.Usage, simulateCacheRate) {
+					usageSimulatedCache = true
+				}
 				if event.Response.Usage != nil {
 					usage = copyOpenAIUsageFromResponsesUsage(event.Response.Usage)
 				}
+			}
+			if event.Usage != nil && applySimulateCacheRateToResponsesUsage(event.Usage, simulateCacheRate) {
+				usageSimulatedCache = true
 			}
 			if event.Usage != nil {
 				usage = copyOpenAIUsageFromResponsesUsage(event.Usage)

@@ -223,6 +223,13 @@ type Account struct {
 	CacheTTLOverrideEnabled *bool   `json:"cache_ttl_override_enabled,omitempty"`
 	CacheTTLOverrideTarget  *string `json:"cache_ttl_override_target,omitempty"`
 
+	// 模拟缓存（对所有账号类型有效）
+	// 启用后对该账号的每次请求，按 min~max 百分比随机将 input_tokens 拆分为
+	// cache_read_input_tokens，覆盖上游真实缓存命中数据，用于统一下游定价
+	SimulateCacheEnabled    *bool    `json:"simulate_cache_enabled,omitempty"`
+	SimulateCacheMinPercent *float64 `json:"simulate_cache_min_percent,omitempty"`
+	SimulateCacheMaxPercent *float64 `json:"simulate_cache_max_percent,omitempty"`
+
 	// 自定义 Base URL 中继转发（仅 Anthropic OAuth/SetupToken 账号有效）
 	CustomBaseURLEnabled *bool   `json:"custom_base_url_enabled,omitempty"`
 	CustomBaseURL        *string `json:"custom_base_url,omitempty"`

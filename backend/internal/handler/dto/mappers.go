@@ -292,6 +292,16 @@ func AccountFromServiceShallow(a *service.Account) *Account {
 		}
 	}
 
+	// 模拟缓存（所有账号类型有效）
+	if a.IsSimulateCacheEnabled() {
+		enabled := true
+		out.SimulateCacheEnabled = &enabled
+		minPct := a.GetSimulateCacheMinPercent()
+		out.SimulateCacheMinPercent = &minPct
+		maxPct := a.GetSimulateCacheMaxPercent()
+		out.SimulateCacheMaxPercent = &maxPct
+	}
+
 	// 提取账号配额限制（apikey / bedrock 类型有效）
 	if a.IsAPIKeyOrBedrock() {
 		if limit := a.GetQuotaLimit(); limit > 0 {

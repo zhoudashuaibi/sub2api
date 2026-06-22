@@ -3705,6 +3705,15 @@ export default {
       errorCodeExists: '该错误码已被选中',
       interceptWarmupRequests: '拦截预热请求',
       interceptWarmupRequestsDesc: '启用后，标题生成等预热请求将返回 mock 响应，不消耗上游 token',
+      simulateCache: {
+        label: '模拟缓存',
+        hint: '上游无缓存命中概念时，按随机百分比将输入 token 拆分为缓存命中，覆盖上游缓存数据，用于统一下游定价。若上游已有缓存也会被覆盖。',
+        minPercent: '最小命中百分比',
+        maxPercent: '最大命中百分比',
+        minPercentPlaceholder: '0-100',
+        maxPercentPlaceholder: '0-100',
+        rangeHint: '每次请求的缓存命中率将在最小与最大百分比之间随机取值。输入 token × 缓存率 = 缓存命中 token，剩余为未命中。'
+      },
       autoPauseOnExpired: '过期自动暂停调度',
       autoPauseOnExpiredDesc: '启用后，账号过期将自动暂停调度',
 	  autoPause5hThreshold: '5h 用量阈值(%)',

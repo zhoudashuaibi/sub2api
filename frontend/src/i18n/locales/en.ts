@@ -3556,6 +3556,15 @@ export default {
       interceptWarmupRequests: 'Intercept Warmup Requests',
       interceptWarmupRequestsDesc:
         'When enabled, warmup requests like title generation will return mock responses without consuming upstream tokens',
+      simulateCache: {
+        label: 'Simulate Cache',
+        hint: 'When the upstream has no cache-hit concept, split input tokens into cache-read by a random percentage to unify downstream pricing. Overrides any real upstream cache data.',
+        minPercent: 'Min Hit Percentage',
+        maxPercent: 'Max Hit Percentage',
+        minPercentPlaceholder: '0-100',
+        maxPercentPlaceholder: '0-100',
+        rangeHint: 'The cache hit rate for each request is randomly chosen between min and max. Input tokens × hit rate = cache-read tokens; the rest are non-cached.'
+      },
       autoPauseOnExpired: 'Auto Pause On Expired',
       autoPauseOnExpiredDesc: 'When enabled, the account will auto pause scheduling after it expires',
 	  autoPause5hThreshold: '5h Usage Threshold (%)',
