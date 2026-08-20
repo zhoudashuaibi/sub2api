@@ -3319,13 +3319,23 @@ func TestOpenAIWSHTTPBridgeSSEErrorSideEffectsRunOncePerPlatform(t *testing.T) {
 		t.Run(platform, func(t *testing.T) {
 			repo := &grokQuotaAccountRepo{}
 			cfg := &config.Config{}
-			upstream := &httpUpstreamRecorder{resp: &http.Response{
-				StatusCode: http.StatusOK,
-				Header:     make(http.Header),
-				Body: io.NopCloser(strings.NewReader(
-					"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"limited\"}}\n\n",
-				)),
-			}}
+			// 卡429 双重确认需要两轮独立的上游 SSE 错误流；resp 单实例的 body
+			// 第一轮就被读空，故用 responses 队列逐轮提供新响应。
+			newRateLimitSSEResp := func() *http.Response {
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body: io.NopCloser(strings.NewReader(
+						"data: {\"type\":\"error\",\"error\":{\"type\":\"rate_limit_error\",\"code\":\"rate_limit_exceeded\",\"message\":\"limited\"}}\n\n",
+					)),
+				}
+			}
+			upstream := &httpUpstreamRecorder{}
+			if platform == PlatformOpenAI {
+				upstream.responses = []*http.Response{newRateLimitSSEResp(), newRateLimitSSEResp()}
+			} else {
+				upstream.resp = newRateLimitSSEResp()
+			}
 			svc := &OpenAIGatewayService{
 				cfg:          cfg,
 				accountRepo:  repo,
