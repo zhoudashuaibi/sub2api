@@ -185,14 +185,11 @@ func shouldCooldownOpenAITransientUpstreamError(statusCode int, responseBody []b
 	}
 }
 
-// confirmOpenAIOAuth429 requires two explicit upstream 429 responses for the
-// same Codex OAuth account within a short window before account-level cooldown
-// is persisted. The first response still fails the current request and allows
-// normal failover, but it does not poison future scheduling by itself.
-func (s *OpenAIGatewayService) confirmOpenAIOAuth429(accountID int64, now time.Time) bool {
-	return s.confirmOpenAIOAuth429Context(context.Background(), accountID, now)
-}
-
+// confirmOpenAIOAuth429Context requires two explicit upstream 429 responses
+// for the same Codex OAuth account within a short window before account-level
+// cooldown is persisted. The first response still fails the current request
+// and allows normal failover, but it does not poison future scheduling by
+// itself.
 func (s *OpenAIGatewayService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
 	if s == nil || accountID <= 0 {
 		return false
