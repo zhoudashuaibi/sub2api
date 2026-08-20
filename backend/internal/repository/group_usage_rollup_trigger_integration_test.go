@@ -123,6 +123,9 @@ func TestGroupUsageRollupTriggerSerializesLateHistoricalInsertWithPublish(t *tes
 	require.Equal(t, "2020-01-02", closedBefore)
 }
 
+// 触发器按 session 时区（current_setting('TimeZone')，integration harness 为 UTC）
+// 解释日期；"今天"相关表达式必须用 CURRENT_TIMESTAMP::date 与之对齐，
+// 不得用 Asia/Shanghai——北京时间 00:00-08:00 期间两个时区的日期差一天。
 func TestGroupUsageRollupTriggerSerializesInsertTransactionAcrossMidnight(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
@@ -133,7 +136,7 @@ func TestGroupUsageRollupTriggerSerializesInsertTransactionAcrossMidnight(t *tes
 		INSERT INTO groups (id) VALUES (10);
 		INSERT INTO users (id) VALUES (1);
 		UPDATE usage_group_rollup_state
-		SET closed_before = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date
+		SET closed_before = CURRENT_TIMESTAMP::date
 		WHERE id = 1;
 	`)
 	require.NoError(t, err)
@@ -173,7 +176,7 @@ func TestGroupUsageRollupTriggerSerializesInsertTransactionAcrossMidnight(t *tes
 
 	_, err = syncTx.ExecContext(ctx, `
 		UPDATE usage_group_rollup_state
-		SET closed_before = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date + 1
+		SET closed_before = CURRENT_TIMESTAMP::date + 1
 		WHERE id = 1
 	`)
 	require.NoError(t, err)
@@ -189,7 +192,7 @@ func TestGroupUsageRollupTriggerSerializesInsertTransactionAcrossMidnight(t *tes
 
 	var currentDate string
 	require.NoError(t, integrationDB.QueryRowContext(ctx, `
-		SELECT (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date::text
+		SELECT CURRENT_TIMESTAMP::date::text
 	`).Scan(&currentDate))
 	var closedBefore string
 	err = integrationDB.QueryRowContext(ctx, fmt.Sprintf(
@@ -210,7 +213,7 @@ func TestGroupUsageRollupTriggerKeepsWatermarkForTodayInsert(t *testing.T) {
 		INSERT INTO groups (id) VALUES (10);
 		INSERT INTO users (id) VALUES (1);
 		UPDATE usage_group_rollup_state
-		SET closed_before = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date
+		SET closed_before = CURRENT_TIMESTAMP::date
 		WHERE id = 1;
 		INSERT INTO usage_logs (id, user_id, group_id, actual_cost, created_at)
 		VALUES (1, 1, 10, 1.25, CURRENT_TIMESTAMP);
@@ -219,7 +222,7 @@ func TestGroupUsageRollupTriggerKeepsWatermarkForTodayInsert(t *testing.T) {
 
 	var unchanged bool
 	err = tx.QueryRowContext(ctx, `
-		SELECT closed_before = (CURRENT_TIMESTAMP AT TIME ZONE 'Asia/Shanghai')::date
+		SELECT closed_before = CURRENT_TIMESTAMP::date
 		FROM usage_group_rollup_state
 		WHERE id = 1
 	`).Scan(&unchanged)
