@@ -3355,6 +3355,22 @@ func TestOpenAIWSHTTPBridgeSSEErrorSideEffectsRunOncePerPlatform(t *testing.T) {
 			require.ErrorAs(t, err, &failoverErr)
 			require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
 			require.Zero(t, writes)
+			if platform == PlatformOpenAI {
+				// 卡429 双重确认：首次 OAuth 429 只计数不落库，第 2 次确认后才持久化限流状态。
+				require.Zero(t, repo.rateLimitedCalls, "first OAuth 429 must not persist rate-limit state")
+				result, err = svc.proxyOpenAIWSHTTPBridgeTurn(
+					context.Background(), c, account, "sk-test", payload, len(payload),
+					"gpt-5", "", "", "", "", 2,
+					func([]byte) error {
+						writes++
+						return nil
+					},
+				)
+				require.Nil(t, result)
+				require.ErrorAs(t, err, &failoverErr)
+				require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
+				require.Zero(t, writes)
+			}
 			require.Equal(t, 1, repo.rateLimitedCalls)
 		})
 	}

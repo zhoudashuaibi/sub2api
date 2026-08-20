@@ -18,12 +18,17 @@ func TestOpenAI429FastPath_MarksOAuthAccountCoolingDown(t *testing.T) {
 	account := &Account{ID: 42, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
 	apiKeyAccount := &Account{ID: 43, Platform: PlatformOpenAI, Type: AccountTypeAPIKey}
 
-	shouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+	// 卡429 双重确认：30 秒窗口内第 1 次 429 只计数，不冷却账号（当前请求照常失败转移）。
+	first := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
+	require.False(t, first)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account), "首次 429 不得冷却账号")
+
+	second := svc.handleOpenAIAccountUpstreamError(context.Background(), account, http.StatusTooManyRequests, http.Header{}, nil)
 	apiKeyShouldDisable := svc.handleOpenAIAccountUpstreamError(context.Background(), apiKeyAccount, http.StatusTooManyRequests, http.Header{}, nil)
 
-	require.False(t, shouldDisable)
+	require.False(t, second)
 	require.False(t, apiKeyShouldDisable)
-	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
+	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account), "窗口内第 2 次 429 确认后才冷却账号")
 	require.False(t, svc.isOpenAIAccountRuntimeBlocked(apiKeyAccount))
 }
 
@@ -307,6 +312,18 @@ func TestOpenAIOAuth429_MatchingModelTempRuleAvoidsAccountRuntimeBlock(t *testin
 		},
 	}
 
+	// 首次 429 未双重确认，早退失败转移，模型隔离留待确认后的第 2 次。
+	first := svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusTooManyRequests,
+		http.Header{},
+		[]byte(`{"error":{"message":"model quota exhausted"}}`),
+		"gpt-5.4",
+	)
+	require.False(t, first)
+	require.Empty(t, repo.modelRateLimitCalls)
+
 	shouldDisable := svc.handleOpenAIAccountUpstreamError(
 		context.Background(),
 		account,
@@ -336,6 +353,18 @@ func TestOpenAIOAuth429_NonmatchingModelTempRuleKeepsAccountRuntimeBlock(t *test
 			"duration_minutes": float64(10),
 		},
 	}
+
+	// 首次 429 未双重确认，不冷却账号。
+	first := svc.handleOpenAIAccountUpstreamError(
+		context.Background(),
+		account,
+		http.StatusTooManyRequests,
+		http.Header{},
+		[]byte(`{"error":{"message":"global rate limit"}}`),
+		"gpt-5.4",
+	)
+	require.False(t, first)
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
 
 	shouldDisable := svc.handleOpenAIAccountUpstreamError(
 		context.Background(),
