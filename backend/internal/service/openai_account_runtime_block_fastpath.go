@@ -12,17 +12,43 @@ import (
 const (
 	openAIAccountStateUpdateTimeout       = 5 * time.Second
 	openAIOAuth429FallbackCooldown        = 5 * time.Second
+	openAIOAuth429ConfirmationWindow      = 30 * time.Second
 	openAIStopSchedulingBridgeCooldown    = 2 * time.Minute
 	openAIOAuth429StormWindow             = 10 * time.Second
 	openAIOAuth429StormThreshold          = 20
 	openAIOAuth429StormMaxAccountSwitches = 1
 )
 
+// openAIOAuth429StreakState 记录单账号未确认的 OAuth 429 连击：
+// 30 秒窗口内凑满 2 次才确认为真实限流并进入账号冷却。
+type openAIOAuth429StreakState struct {
+	Count              int
+	UpdatedAt          time.Time
+	RemoteResetPending bool
+}
+
 // OpenAIOAuth429FailoverState tracks the request-local follow-up budget after
 // the first Grok OAuth 429. Once that 429 occurs, exactly one different account
 // may be attempted; any failure from that follow-up account ends failover.
 type OpenAIOAuth429FailoverState struct {
 	grokOAuth429FollowupPending bool
+}
+
+type openAIOAuth429ConfirmedContextKey struct{}
+
+func withOpenAIOAuth429Confirmed(ctx context.Context) context.Context {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return context.WithValue(ctx, openAIOAuth429ConfirmedContextKey{}, true)
+}
+
+func openAIOAuth429AlreadyConfirmed(ctx context.Context) bool {
+	if ctx == nil {
+		return false
+	}
+	confirmed, _ := ctx.Value(openAIOAuth429ConfirmedContextKey{}).(bool)
+	return confirmed
 }
 
 func openAIAccountStateContext(ctx context.Context) (context.Context, context.CancelFunc) {
@@ -85,6 +111,26 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 	if s.rateLimitService != nil && len(canonicalModel) > 0 && s.rateLimitService.HandleUpstreamModelNotFound(stateCtx, account, canonicalModel[0], statusCode, responseBody) {
 		return true
 	}
+	// OAuth 429 双重确认：30 秒窗口内第 1 次 429 不冷却账号（当前请求照常失败转移），
+	// 第 2 次确认后才进入 markOpenAIOAuth429RateLimited。合成上下文注入（卡429/奸商模式）
+	// 期间账号会周期性收到可重试的 429，单次确认即冷却会误杀仍在出量的账号。
+	confirmedOAuth429 := false
+	if statusCode == http.StatusTooManyRequests && isOpenAIOAuthAccount(account) &&
+		!account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
+		if !s.confirmOpenAIOAuth429Context(stateCtx, account.ID, time.Now()) {
+			repo := s.accountRepo
+			if repo == nil && s.rateLimitService != nil {
+				repo = s.rateLimitService.accountRepo
+			}
+			persistOpenAI429PlanType(stateCtx, repo, account, responseBody)
+			if s.rateLimitService != nil {
+				s.rateLimitService.persistOpenAICodexSnapshot(stateCtx, account, headers)
+			}
+			return false
+		}
+		stateCtx = withOpenAIOAuth429Confirmed(stateCtx)
+		confirmedOAuth429 = true
+	}
 	// Isolate a custom temporary-unschedulable match to the known upstream
 	// model before entering the generic account error path. This keeps the
 	// account available to other models and avoids the account runtime blocker.
@@ -92,7 +138,7 @@ func (s *OpenAIGatewayService) handleOpenAIAccountUpstreamError(ctx context.Cont
 		s.rateLimitService.HandleTempUnschedulable(stateCtx, account, statusCode, responseBody, canonicalModel[0]) {
 		return true
 	}
-	if statusCode == http.StatusTooManyRequests {
+	if confirmedOAuth429 {
 		s.markOpenAIOAuth429RateLimited(stateCtx, account, headers, responseBody)
 	}
 	if s.rateLimitService == nil {
@@ -137,6 +183,58 @@ func shouldCooldownOpenAITransientUpstreamError(statusCode int, responseBody []b
 	default:
 		return false
 	}
+}
+
+// confirmOpenAIOAuth429 requires two explicit upstream 429 responses for the
+// same Codex OAuth account within a short window before account-level cooldown
+// is persisted. The first response still fails the current request and allows
+// normal failover, but it does not poison future scheduling by itself.
+func (s *OpenAIGatewayService) confirmOpenAIOAuth429(accountID int64, now time.Time) bool {
+	return s.confirmOpenAIOAuth429Context(context.Background(), accountID, now)
+}
+
+func (s *OpenAIGatewayService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	if s.rateLimitService != nil {
+		return s.rateLimitService.confirmOpenAIOAuth429Context(ctx, accountID, now)
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	state := openAIOAuth429StreakState{}
+	if raw, ok := s.openaiOAuth429Streak.Load(accountID); ok {
+		state, _ = raw.(openAIOAuth429StreakState)
+	}
+	if state.UpdatedAt.IsZero() || now.Sub(state.UpdatedAt) > openAIOAuth429ConfirmationWindow || now.Before(state.UpdatedAt) {
+		state.Count = 0
+	}
+	state.Count++
+	state.UpdatedAt = now
+	if state.Count >= 2 {
+		s.openaiOAuth429Streak.Delete(accountID)
+		return true
+	}
+	s.openaiOAuth429Streak.Store(accountID, state)
+	return false
+}
+
+func (s *OpenAIGatewayService) clearOpenAIOAuth429Streak(accountID int64) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	// Reset the distributed mirror before taking the local runtime lock. A
+	// concurrent confirmation that starts after this reset belongs to the
+	// fresh generation and must not be erased by a late local cleanup.
+	if s.rateLimitService != nil {
+		s.rateLimitService.clearOpenAIOAuth429Streak(accountID)
+	}
+	mu := s.openAIAccountRuntimeBlockLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+	s.openaiOAuth429Streak.Delete(accountID)
 }
 
 func (s *OpenAIGatewayService) markOpenAIOAuth429RateLimited(ctx context.Context, account *Account, headers http.Header, responseBody []byte) {

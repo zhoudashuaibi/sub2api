@@ -135,6 +135,11 @@ func (s *OpenAIGatewayService) RecordUsage(ctx context.Context, input *OpenAIRec
 	if result == nil {
 		return errors.New("openai usage result is nil")
 	}
+	// 成功请求清空该账号未确认的 OAuth 429 连击（本地 + Redis），
+	// 与卡429（奸商模式）的 30 秒双重确认配合，避免误冷却仍在出量的账号。
+	if input.Account != nil && input.Account.IsOpenAIOAuth() && !input.CyberBlocked && result.SucceededForScheduling() {
+		s.clearOpenAIOAuth429Streak(input.Account.ID)
+	}
 	if s.rateLimitService != nil && input.Account != nil && input.Account.Platform == PlatformOpenAI {
 		s.rateLimitService.ResetOpenAI403Counter(ctx, input.Account.ID)
 	}

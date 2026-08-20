@@ -1715,6 +1715,44 @@ func (a *Account) GetOpenAISessionID() string {
 	return strings.TrimSpace(a.GetExtraString("openai_session_id"))
 }
 
+// OpenAICodex429GuardEnabledExtraKey controls the opt-in Codex-only history
+// checkpoint used by the 429 guard (the UI calls this "奸商模式"). Missing
+// values stay disabled so existing accounts do not change behavior silently.
+const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
+
+// Codex429GuardEnabled 报告该 OpenAI OAuth 账号是否启用卡429（奸商模式）合成上下文注入。
+// 影子账号与 spark 维度账号不参与。
+func (a *Account) Codex429GuardEnabled() bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark {
+		return false
+	}
+	if a.Extra == nil {
+		return false
+	}
+	raw, exists := a.Extra[OpenAICodex429GuardEnabledExtraKey]
+	if !exists || raw == nil {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		return err == nil && parsed
+	case json.Number:
+		parsed, err := strconv.ParseBool(value.String())
+		return err == nil && parsed
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case int64:
+		return value != 0
+	default:
+		return false
+	}
+}
+
 func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapability) bool {
 	if a == nil {
 		return false

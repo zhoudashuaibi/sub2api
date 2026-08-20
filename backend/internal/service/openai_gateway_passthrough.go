@@ -157,6 +157,15 @@ func (s *OpenAIGatewayService) forwardOpenAIPassthrough(
 		if normalized {
 			body = normalizedBody
 		}
+		if account.Codex429GuardEnabled() && !isOpenAIResponsesCompactPath(c) && !isOpenAICompatMessagesBridgeBody(body) {
+			bodyWithContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(body)
+			if appendErr != nil {
+				return nil, fmt.Errorf("append passthrough agent context checkpoint: %w", appendErr)
+			}
+			if appended {
+				body = bodyWithContextPair
+			}
+		}
 		reqStream = gjson.GetBytes(body, "stream").Bool()
 
 		stageCodexFingerprintIDs(c, nil)

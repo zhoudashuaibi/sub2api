@@ -248,6 +248,15 @@ func (s *OpenAIGatewayService) ProxyResponsesWebSocketFromClient(
 				nil,
 			)
 		}
+		if account.Codex429GuardEnabled() && !isOpenAICompatMessagesBridgeBody(normalized) {
+			withContextPair, appended, appendErr := appendCodexSyntheticAgentContextPairToBody(normalized)
+			if appendErr != nil {
+				return openAIWSClientPayload{}, NewOpenAIWSClientCloseError(coderws.StatusPolicyViolation, "invalid websocket request payload", appendErr)
+			}
+			if appended {
+				normalized = withContextPair
+			}
+		}
 		if turnMetadata := strings.TrimSpace(c.GetHeader(openAIWSTurnMetadataHeader)); turnMetadata != "" {
 			next, setErr := applyPayloadMutation(normalized, "client_metadata."+openAIWSTurnMetadataHeader, turnMetadata)
 			if setErr != nil {

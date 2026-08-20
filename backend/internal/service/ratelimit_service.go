@@ -20,20 +20,21 @@ import (
 
 // RateLimitService 处理限流和过载状态管理
 type RateLimitService struct {
-	accountRepo           AccountRepository
-	usageRepo             UsageLogRepository
-	cfg                   *config.Config
-	geminiQuotaService    *GeminiQuotaService
-	tempUnschedCache      TempUnschedCache
-	timeoutCounterCache   TimeoutCounterCache
-	openAI403CounterCache OpenAI403CounterCache
-	settingService        *SettingService
-	tokenCacheInvalidator TokenCacheInvalidator
-	runtimeBlocker        AccountRuntimeBlocker
-	usageCacheMu          sync.RWMutex
-	usageCache            map[int64]*geminiUsageCacheEntry
-
-	// OpenAI Team 联动熔断的进程内去重：teamID → 去重窗口截止时间
+	accountRepo            AccountRepository
+	usageRepo              UsageLogRepository
+	cfg                    *config.Config
+	geminiQuotaService     *GeminiQuotaService
+	tempUnschedCache       TempUnschedCache
+	timeoutCounterCache    TimeoutCounterCache
+	openAI403CounterCache  OpenAI403CounterCache
+	openAI429CounterCache  OpenAI429CounterCache
+	settingService         *SettingService
+	tokenCacheInvalidator  TokenCacheInvalidator
+	runtimeBlocker         AccountRuntimeBlocker
+	usageCacheMu           sync.RWMutex
+	usageCache             map[int64]*geminiUsageCacheEntry
+	openAI429Locks         sync.Map
+	openAI429Streak        sync.Map
 	openaiTeamLinkedMu     sync.Mutex
 	openaiTeamLinkedRecent map[string]time.Time
 }
@@ -104,6 +105,102 @@ func (s *RateLimitService) SetTimeoutCounterCache(cache TimeoutCounterCache) {
 // SetOpenAI403CounterCache 设置 OpenAI 403 连续失败计数器（可选依赖）
 func (s *RateLimitService) SetOpenAI403CounterCache(cache OpenAI403CounterCache) {
 	s.openAI403CounterCache = cache
+}
+
+// SetOpenAI429CounterCache 设置 OpenAI OAuth 429 双重确认计数器（可选依赖）
+func (s *RateLimitService) SetOpenAI429CounterCache(cache OpenAI429CounterCache) {
+	s.openAI429CounterCache = cache
+}
+
+// confirmOpenAIOAuth429Context 记录一次 OAuth 429，30 秒窗口内凑满 2 次才返回 true
+// （账号进入冷却）。本地 streak 与 Redis 计数器取最大值，多实例部署仍能完成确认。
+func (s *RateLimitService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	state := openAIOAuth429StreakState{}
+	if raw, ok := s.openAI429Streak.Load(accountID); ok {
+		state, _ = raw.(openAIOAuth429StreakState)
+	}
+	if state.UpdatedAt.IsZero() || now.Sub(state.UpdatedAt) > openAIOAuth429ConfirmationWindow || now.Before(state.UpdatedAt) {
+		state.Count = 0
+		state.UpdatedAt = time.Time{}
+	}
+
+	if state.RemoteResetPending && s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_retry_failed", "account_id", accountID, "error", err)
+		} else {
+			// The remote counter belongs to the streak before the successful
+			// response. Keep locally observed 429s from the new generation; only
+			// the stale remote generation is being discarded here.
+			state.RemoteResetPending = false
+		}
+	}
+
+	state.Count++
+	state.UpdatedAt = now
+
+	var remoteCount int64
+	if s.openAI429CounterCache != nil && !state.RemoteResetPending {
+		count, err := s.openAI429CounterCache.IncrementOpenAI429Count(ctx, accountID, openAIOAuth429ConfirmationWindow)
+		if err != nil {
+			slog.Warn("openai_429_confirmation_cache_failed", "account_id", accountID, "error", err)
+		} else {
+			remoteCount = count
+			if int64(state.Count) < count {
+				state.Count = int(count)
+			}
+		}
+	}
+	if state.Count >= 2 || remoteCount >= 2 {
+		if state.RemoteResetPending {
+			state.Count = 0
+			state.UpdatedAt = time.Time{}
+			s.openAI429Streak.Store(accountID, state)
+		} else {
+			s.openAI429Streak.Delete(accountID)
+		}
+		return true
+	}
+
+	s.openAI429Streak.Store(accountID, state)
+	return false
+}
+
+func (s *RateLimitService) openAI429AccountLock(accountID int64) *sync.Mutex {
+	lock, _ := s.openAI429Locks.LoadOrStore(accountID, &sync.Mutex{})
+	mu, ok := lock.(*sync.Mutex)
+	if !ok {
+		panic("openAI429Locks contains a non-mutex value")
+	}
+	return mu
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429Streak(accountID int64) {
+	s.clearOpenAIOAuth429StreakContext(context.Background(), accountID)
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429StreakContext(ctx context.Context, accountID int64) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_failed", "account_id", accountID, "error", err)
+			s.openAI429Streak.Store(accountID, openAIOAuth429StreakState{RemoteResetPending: true})
+			return
+		}
+	}
+	s.openAI429Streak.Delete(accountID)
 }
 
 // SetSettingService 设置系统设置服务（可选依赖）
@@ -275,6 +372,20 @@ func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Acc
 	// Team 联动熔断必须先于池模式/自定义错误码/临时不可调度的各类早退；
 	// 同请求内与 fastpath 调用点的重复触发由方法内去重吸收。
 	s.maybeHandleOpenAITeamLinkedError(ctx, account, statusCode, responseBody)
+	// OpenAI OAuth 429 双重确认：30 秒窗口内第 2 次明确 429 才继续走限流标记；
+	// 第 1 次 429 直接返回 false，账号保持可调度，请求由网关层失败转移。
+	if account.IsOpenAIOAuth() && !account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
+		if statusCode != http.StatusTooManyRequests {
+			s.clearOpenAIOAuth429StreakContext(ctx, account.ID)
+		} else if !openAIOAuth429AlreadyConfirmed(ctx) {
+			persistOpenAI429PlanType(ctx, s.accountRepo, account, responseBody)
+			s.persistOpenAICodexSnapshot(ctx, account, headers)
+			if !s.confirmOpenAIOAuth429Context(ctx, account.ID, time.Now()) {
+				slog.Info("openai_429_confirmation_pending", "account_id", account.ID, "count", 1, "required", 2)
+				return false
+			}
+		}
+	}
 	customErrorCodesEnabled := account.IsCustomErrorCodesEnabled()
 
 	// 池模式默认不标记本地账号状态；但管理员显式配置的临时不可调度规则优先。

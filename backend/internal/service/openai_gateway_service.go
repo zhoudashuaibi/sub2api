@@ -468,6 +468,9 @@ type OpenAIGatewayService struct {
 	// 剥离跨账号回带（openai_codex_turn_state.go）。
 	openaiCodexTurnStateOrigins sync.Map
 	openaiCodexTurnStateWrites  atomic.Uint64
+	// openaiOAuth429Streak: key int64(accountID) → openAIOAuth429StreakState，
+	// 仅在 rateLimitService 缺席（测试装配）时作为 429 双重确认的本地兜底。
+	openaiOAuth429Streak sync.Map
 }
 
 // NewOpenAIGatewayService creates a new OpenAIGatewayService

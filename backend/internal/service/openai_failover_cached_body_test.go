@@ -126,6 +126,12 @@ func TestOpenAIGatewayService_HandleFailoverSideEffects_DoesNotRereadResponseBod
 	require.NotPanics(t, func() {
 		svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
 	})
+	// OAuth 429 双重确认：第 1 次 429 不冷却账号（当前请求照常失败转移）。
+	require.False(t, svc.isOpenAIAccountRuntimeBlocked(account))
+
+	require.NotPanics(t, func() {
+		svc.handleFailoverSideEffects(context.Background(), resp, account, []byte(`{"error":{"type":"rate_limit_error","message":"rate limited"}}`))
+	})
 
 	require.True(t, svc.isOpenAIAccountRuntimeBlocked(account))
 }

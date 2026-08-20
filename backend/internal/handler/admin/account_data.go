@@ -75,6 +75,7 @@ type DataAccount struct {
 type DataImportRequest struct {
 	Data                 DataPayload `json:"data"`
 	SkipDefaultGroupBind *bool       `json:"skip_default_group_bind"`
+	Codex429GuardEnabled *bool       `json:"codex_429_guard_enabled"`
 }
 
 type DataImportResult struct {
@@ -428,6 +429,20 @@ func (h *AccountHandler) importData(ctx context.Context, req DataImportRequest) 
 		}
 
 		enrichCredentialsFromIDToken(&item)
+
+		// 导入开关只作用于 OpenAI OAuth；其余账号先剥离可能残留的卡429键，
+		// 再按请求级设置统一应用，避免让一个过期设置影响无关账号的导入。
+		if item.Platform != service.PlatformOpenAI || item.Type != service.AccountTypeOAuth {
+			if item.Extra != nil {
+				delete(item.Extra, service.OpenAICodex429GuardEnabledExtraKey)
+			}
+		}
+		if req.Codex429GuardEnabled != nil && item.Platform == service.PlatformOpenAI && item.Type == service.AccountTypeOAuth {
+			if item.Extra == nil {
+				item.Extra = make(map[string]any)
+			}
+			item.Extra[service.OpenAICodex429GuardEnabledExtraKey] = *req.Codex429GuardEnabled
+		}
 
 		accountInput := &service.CreateAccountInput{
 			Name:                 item.Name,

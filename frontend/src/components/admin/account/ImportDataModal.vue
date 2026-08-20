@@ -51,6 +51,24 @@
         />
       </div>
 
+      <div class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 p-3 dark:border-dark-600">
+        <div class="min-w-0">
+          <label class="input-label mb-0">{{ t('admin.accounts.openai.codex429Guard') }}</label>
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.openai.codex429GuardHint') }}
+          </p>
+        </div>
+        <label class="flex shrink-0 items-center gap-2 text-xs text-gray-600 dark:text-dark-300">
+          <input
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+            :checked="codex429GuardEnabled"
+            @change="codex429GuardEnabled = ($event.target as HTMLInputElement).checked; codex429GuardOverride = true"
+          />
+          {{ t('admin.accounts.openai.codex429GuardApply') }}
+        </label>
+      </div>
+
       <div
         v-if="result"
         class="space-y-2 rounded-xl border border-gray-200 p-4 dark:border-dark-700"
@@ -120,6 +138,8 @@ const appStore = useAppStore()
 
 const importing = ref(false)
 const files = ref<File[]>([])
+const codex429GuardEnabled = ref(false)
+const codex429GuardOverride = ref(false)
 const dragDepth = ref(0)
 const dragActive = computed(() => dragDepth.value > 0)
 const hasCreatedData = ref(false)
@@ -143,6 +163,8 @@ watch(
       dragDepth.value = 0
       hasCreatedData.value = false
       result.value = null
+      codex429GuardEnabled.value = false
+      codex429GuardOverride.value = false
       if (fileInput.value) {
         fileInput.value.value = ''
       }
@@ -293,10 +315,18 @@ const handleImport = async () => {
     }
     const dataPayload = mergeDataPayloads(dataPayloads)
 
-    const res = await adminAPI.accounts.importData({
+    const importPayload: {
+      data: AdminDataPayload
+      skip_default_group_bind?: boolean
+      codex_429_guard_enabled?: boolean
+    } = {
       data: dataPayload,
       skip_default_group_bind: true
-    })
+    }
+    if (codex429GuardOverride.value) {
+      importPayload.codex_429_guard_enabled = codex429GuardEnabled.value
+    }
+    const res = await adminAPI.accounts.importData(importPayload)
 
     result.value = res
 

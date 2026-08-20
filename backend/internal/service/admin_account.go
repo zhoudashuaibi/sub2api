@@ -396,6 +396,28 @@ func normalizeOpenAILongContextBillingUpdateExtra(account *Account, input *Updat
 	return normalized, nil
 }
 
+// ValidateOpenAICodex429GuardExtra 校验卡429（奸商模式）开关只出现在 OpenAI OAuth 账号上，
+// 且值必须为 bool，防止其他平台/账号类型携带该键产生隐式行为。
+func ValidateOpenAICodex429GuardExtra(platform, accountType string, extra map[string]any) error {
+	raw, exists := extra[OpenAICodex429GuardEnabledExtraKey]
+	if !exists {
+		return nil
+	}
+	if _, ok := raw.(bool); !ok {
+		return infraerrors.BadRequest(
+			"OPENAI_CODEX_429_GUARD_INVALID",
+			"openai_codex_429_guard_enabled must be a boolean",
+		)
+	}
+	if platform != PlatformOpenAI || accountType != AccountTypeOAuth {
+		return infraerrors.BadRequest(
+			"OPENAI_CODEX_429_GUARD_ACCOUNT_INVALID",
+			"openai_codex_429_guard_enabled only applies to OpenAI OAuth accounts",
+		)
+	}
+	return nil
+}
+
 // Grok media eligibility helpers live in account_grok_media_eligibility.go.
 
 func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]any) (*Account, error) {
@@ -406,6 +428,12 @@ func buildAccountForCreate(input *CreateAccountInput, accountExtra map[string]an
 	delete(accountExtra, OllamaCloudUsageSessionExtraKey)
 	delete(accountExtra, OllamaCloudUsageAutoRefreshExtraKey)
 	delete(accountExtra, OllamaCloudUsageSnapshotExtraKey)
+	if err := ValidateOpenAICodex429GuardExtra(input.Platform, input.Type, accountExtra); err != nil {
+		return nil, err
+	}
+	if input.Platform != PlatformOpenAI || input.Type != AccountTypeOAuth {
+		delete(accountExtra, OpenAICodex429GuardEnabledExtraKey)
+	}
 	accountExtra = prepareCodexFingerprintExtraForCreate(input.Platform, input.Type, accountExtra)
 	account := &Account{
 		Name:        input.Name,
@@ -559,6 +587,13 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 		if err != nil {
 			return nil, err
 		}
+		effectiveType := account.Type
+		if input.Type != "" {
+			effectiveType = input.Type
+		}
+		if err := ValidateOpenAICodex429GuardExtra(account.Platform, effectiveType, normalizedExtra); err != nil {
+			return nil, err
+		}
 	}
 	previousProbeIdentity := upstreamBillingProbeIdentity(account)
 	previousOllamaUsageIdentity := ollamaCloudUsageIdentity(account)
@@ -676,6 +711,11 @@ func (s *adminServiceImpl) UpdateAccount(ctx context.Context, id int64, input *U
 	}
 	if input.Extra == nil {
 		account.Extra = prepareCodexFingerprintExtraForUpdate(account, account.Extra)
+	}
+	// 账号类型变更出 OpenAI OAuth 后，卡429（奸商模式）开关不再有意义，直接清除，
+	// 避免遗留键在账号切回 OAuth 时静默复活。
+	if !account.IsOpenAIOAuth() && account.Extra != nil {
+		delete(account.Extra, OpenAICodex429GuardEnabledExtraKey)
 	}
 	if requestedRateSyncEnabledUpdate != nil && *requestedRateSyncEnabledUpdate {
 		if requestedProbeEnabledUpdate != nil && !*requestedProbeEnabledUpdate {

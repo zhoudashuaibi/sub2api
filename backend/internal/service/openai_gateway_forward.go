@@ -415,7 +415,11 @@ func (s *OpenAIGatewayService) Forward(ctx context.Context, c *gin.Context, acco
 			ensureCodexOAuthInstructionsField(decoded)
 			markDecodedModified()
 		} else {
-			codexResult = applyCodexOAuthTransform(decoded, isCodexCLI, isCompactRequest)
+			codexResult = applyCodexOAuthTransformWithOptions(decoded, codexOAuthTransformOptions{
+				IsCodexCLI:           isCodexCLI,
+				IsCompact:            isCompactRequest,
+				Codex429GuardEnabled: account.Codex429GuardEnabled(),
+			})
 		}
 		if codexResult.Modified {
 			markDecodedModified()
